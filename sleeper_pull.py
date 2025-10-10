@@ -7,21 +7,18 @@ import os
 def main():
     league_id = '1180303931006689280'
     username = 'TitsBon'
-    week = 5
+    week = 3
 
-    my_roster, opp_roster = pull_team(league_id, username, week)
-    print("My roster:")
-    for p in my_roster:
-        p.print_player()
-    print("\nOpponent's roster:")
-    for p in opp_roster:
-        p.print_player()
+    my_lineup, opp_lineup = pull_team(league_id, username, week)
+    print(my_lineup)
+    print(opp_lineup)
 
 
 def pull_team(league_id, username, week, roster='both'):
     """
     This function calls the sleeper api and obtains the roster data. It has the functionality
     to do this for both the user and the user's opponent.
+    This is kinda gross i wanna make it cleaner
 
     Parameters:
         - league_id (str): This is a string of the league id, a long set of numbers. Ours is 1180303931006689280
@@ -31,11 +28,9 @@ def pull_team(league_id, username, week, roster='both'):
         roster='both' is default.
 
     Returns:
-        - player_data (np.array[Player]): This is a simple vector that houses a bunch of Player objects, one for
-        each player on the team you are requesting. Doing this instead of their dict because they have a ton of 
-        stuff we won't need so transferring everything would be inefficient. Not using a custom dict in the weird
-        scenario of two players having the same name (don't wanna give each player unique keys that seems like a 
-        headache). A simple vector of the starting lineup should work fine. 
+        - player_data (Lineup): This is a simple class that houses the lineup (which is defined below).
+        Doing this instead of their dict because they have a ton of  stuff we won't need so transferring 
+        everything would be inefficient.
         If roster='both' is passed, two of these vectors are returned, the first one for the user's team, the 
         second one for the opponent's team.
     """
@@ -50,6 +45,8 @@ def pull_team(league_id, username, week, roster='both'):
     url_user = f'https://api.sleeper.app/v1/user/{username}'
     user_data = requests.get(url_user).json()
     user_id = user_data['user_id']
+    user_teamname = next(u["metadata"].get("team_name", u["display_name"]) for u in requests.get(f"https://api.sleeper.app/v1/league/{league_id}/users").json() if u["user_id"] == user_id)
+
 
     # --- Find your roster_id (different from owner_id!) ---
     my_roster = next(roster for roster in data if roster['owner_id'] == user_id)
@@ -68,7 +65,8 @@ def pull_team(league_id, username, week, roster='both'):
     # get the starters on the user team
 
     if roster == "user":
-        return build_players(user_roster, players_data)
+        player_list = build_players(user_roster, players_data)
+        return Lineup(player_list, username, user_teamname)
     else:
         # if it isn't just the user, we must get the other starters as well
         # --- Now get the opposing team's roster ---
@@ -80,10 +78,19 @@ def pull_team(league_id, username, week, roster='both'):
         # usually head-to-head => one opponent; use the first if so
         opponent_roster = opponents[0] if opponents else None
 
+        # Get opponent teamname
+        opp_owner_id = next(r['owner_id'] for r in data if r['roster_id'] == opponent_roster['roster_id'])
+        # get all league users (you can move this above and reuse)
+        users = requests.get(f'https://api.sleeper.app/v1/league/{league_id}/users').json()
+        opponent_info = next(u for u in users if u['user_id'] == opp_owner_id)
+        opponent_teamname = opponent_info['metadata'].get('team_name', opponent_info.get('display_name'))
+        opponent_username = opponent_info.get('display_name', opponent_info.get('username'))
+
         if roster == "opponent":
-            return build_players(opponent_roster, players_data)
+            player_list =  build_players(opponent_roster, players_data)
+            return Lineup(player_list, opponent_username, opponent_teamname)
         else:
-            return build_players(user_roster, players_data), build_players(opponent_roster, players_data)
+            return Lineup(build_players(user_roster, players_data), username, user_teamname), Lineup(build_players(opponent_roster, players_data), opponent_username, opponent_teamname)
 
 def build_players(roster, players_data):
     """
@@ -150,12 +157,12 @@ def get_player_metadata(json_file='players_data.json', datefile='last_pull.txt')
 
 
 class Player:
+    """
+    This class houses all of the information that we actually care about for a player. This object is returned
+    for each player in vector format in pull_team(). Note that the variable names are exactly the same as the 
+    unique keys in the dictionary for a player from the Sleeper API. They should be pretty self explainatory.
+    """
     def __init__(self, first_name, last_name, position, injury_status, player_points, team, number):
-        """
-        This class houses all of the information that we actually care about for a player. This object is returned
-        for each player in vector format in pull_team(). Note that the variable names are exactly the same as the 
-        unique keys in the dictionary for a player from the Sleeper API. They should be pretty self explainatory.
-        """
         self.first_name = first_name
         self.last_name = last_name
         self.position = position
@@ -164,8 +171,37 @@ class Player:
         self.team = team
         self.number = number
 
-    def print_player(self):
-        print(f'{self.team} {self.position} - {self.first_name} {self.last_name}: {self.player_points} pts.')
+    def __str__(self):
+        return f'{self.team} {self.position} - {self.first_name} {self.last_name}: {self.player_points} pts.'
+    
+    def __repr__(self):
+        return str(self)
+
+class Lineup:
+    """
+    This is a full lineup, which consists of a list of players, the team name, the user associated with that
+    team, the amount of total points the team has accrued, etc.
+    """
+    def __init__(self, player_list, username, team_name):
+        self.player_list = player_list
+        self.username = username
+        self.team_name = team_name
+        self.total_points = self.calc_total_points()
+
+    def calc_total_points(self):
+        pts = 0.0
+        for player in self.player_list:
+            pts += player.player_points
+        return pts
+    
+    def __str__(self):
+        string = f"{self.team_name} ({self.username}) - {self.total_points:.2f} Total Points:\n"
+        for player in self.player_list:
+            string += f'{str(player)}\n'
+        return string
+    
+    def __repr__(self):
+        return str(self)
 
 
 if __name__ == "__main__":
