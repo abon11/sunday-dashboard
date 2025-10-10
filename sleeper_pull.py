@@ -5,16 +5,19 @@ from datetime import datetime
 import os
 
 def main():
-    league_id = '1180303931006689280'
-    username = 'TitsBon'
-    week = 3
+    # league_id = '1180303931006689280'  # FFF league
+    # username = 'TitsBon'
+    # week = 3
 
-    my_lineup, opp_lineup = pull_team(league_id, username, week)
-    print(my_lineup)
-    print(opp_lineup)
+    # my_lineup, opp_lineup = pull_lineup(league_id, username, week)
+    # print(my_lineup)
+    # print(opp_lineup)
+
+    pickem_league_id = '1265370587102973952'
+    pull_picks(pickem_league_id, 'abonacci')
 
 
-def pull_team(league_id, username, week, roster='both'):
+def pull_lineup(league_id, username, week, roster='both'):
     """
     This function calls the sleeper api and obtains the roster data. It has the functionality
     to do this for both the user and the user's opponent.
@@ -159,7 +162,7 @@ def get_player_metadata(json_file='players_data.json', datefile='last_pull.txt')
 class Player:
     """
     This class houses all of the information that we actually care about for a player. This object is returned
-    for each player in vector format in pull_team(). Note that the variable names are exactly the same as the 
+    for each player in vector format in pull_lineup(). Note that the variable names are exactly the same as the 
     unique keys in the dictionary for a player from the Sleeper API. They should be pretty self explainatory.
     """
     def __init__(self, first_name, last_name, position, injury_status, player_points, team, number):
@@ -202,6 +205,26 @@ class Lineup:
     
     def __repr__(self):
         return str(self)
+
+
+#################################
+# This is now for the pickem pool
+#################################
+
+def pull_picks(league_id, username):
+    """
+    This should pull a list of all of your picks and what you need from the pickem pool
+    """
+
+    url_user = f'https://api.sleeper.app/v1/user/{username}'
+    user_data = requests.get(url_user).json()
+    user_id = user_data['user_id']
+    users = requests.get(f"https://api.sleeper.app/v1/league/{league_id}/users").json()
+
+    user = next(u for u in users if u["user_id"] == user_id)
+    print(user)
+    # Sleeper's API doesn't include pickem pools yet, but hidden endpoints may exist... must check
+
 
 
 if __name__ == "__main__":
