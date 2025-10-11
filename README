@@ -1,1 +1,3 @@
 This is the code to what will be the most complete personalized sunday dashboard to have alongside NFL redzone, keeping track of bets, big games, and player props for your fantasy teams, all in one place for easy viewing.
+
+To launch the dashboard, type `streamlit run yourscript.py` into the command line.
