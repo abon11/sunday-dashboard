@@ -197,6 +197,44 @@ class Lineup:
             pts += player.player_points
         return pts
     
+    def order_list(self, pos_ordering=["QB", "RB", "WR", "TE", "FLX"]):
+        """
+        This orders the player list by position and then by points
+        """
+        def bubble_sort_players(arr):
+            n = len(arr)
+            for i in range(n - 1):
+                for j in range(0, n - i - 1):
+                    if arr[j].player_points < arr[j + 1].player_points:  # Compare and swap for descending order
+                        arr[j], arr[j + 1] = arr[j + 1], arr[j]
+            return arr
+        
+        newlist = []
+        flexlist = []
+
+        for pos in pos_ordering:
+            if pos != "FLX":
+                players = self.get_players_by_pos(pos)
+                sorted = bubble_sort_players(players)
+                newlist.append(sorted.pop(0))
+                if (pos == "RB" or pos == "WR"):
+                    newlist.append(sorted.pop(0))
+                if len(sorted) > 0:
+                    flexlist.extend(sorted)
+            else:
+                sorted_flex = bubble_sort_players(flexlist)
+                newlist.extend(sorted_flex)
+        self.player_list = newlist
+
+
+
+    def get_players_by_pos(self, pos):
+        players = []
+        for player in self.player_list:
+            if player.position == pos:
+                players.append(player)
+        return players
+
     def __str__(self):
         string = f"{self.team_name} ({self.username}) - {self.total_points:.2f} Total Points:\n"
         for player in self.player_list:
