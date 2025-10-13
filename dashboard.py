@@ -104,10 +104,15 @@ def diff_color(p_points, op_points):
     diff = max(-10, min(10, p_points - op_points))  # clamp between -10 and 10
     normalized = (diff + 10) / 20.0  # map [-10, 10] → [0, 1]
 
-    cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F14B4B", "#F0F04B", "#50EE50"])  # red → yellow → green
+    # cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F14B4B", "#F0F04B", "#50EE50"])  # red → yellow → green
+    cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F63737", "#DCDADA", "#33F333"])
     return mcolors.to_hex(cmap(normalized))
 
 def show_games(week):
+    # For this, the next thing i want to do is make each team clickable, then it brings up a menu basically so you can click on 
+    # a team to bet on them, and the menu has an option to say you bet them ML or spread (and enter spread), then it shows up
+    # at the top with your bet choice and the background of the whole game is green/red slider depending on what the live spread
+    # is in relation to the current spread. It would also be displayed to the right of the game
     st.subheader(f"Full Slate")
     games = pull_games(week)
     for game in games:
