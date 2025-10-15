@@ -97,6 +97,8 @@ def main():
     top_left, top_right = st.columns([3, 1])
     with top_left:
         st.title(f"Football Sunday Dashboard - Week {st.session_state["selected_week"]}")
+        st.write("")
+        
     with top_right:
         st.write("")
         st.write("")
@@ -120,28 +122,39 @@ def main():
             st.session_state["selected_week"] = new_week
             st.rerun()
 
-    # --- Layout Columns ---
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        show_lineup(my_lineup, opp_lineup)
-    with col2:
-        show_lineup(opp_lineup, my_lineup)
-    with col3:
+    # --- Main layout: left side (lineups + bet) and right side (games) ---
+    left, right = st.columns([2, 1], gap="medium")
+
+    # --- LEFT: lineups and bet area grouped together ---
+    with left:
+        # Group both fantasy lineups side by side
+        lineup_cols = st.columns(2, gap="medium")
+        with lineup_cols[0]:
+            show_lineup(my_lineup, opp_lineup)
+        with lineup_cols[1]:
+            show_lineup(opp_lineup, my_lineup)
+
+        # Bet area directly beneath both lineups
+        st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+        show_bet_input_area()
+
+    # --- RIGHT: games list ---
+    with right:
         show_games(st.session_state["selected_week"], st.session_state.bets)
 
-    # --- Bet Entry Section directly below lineups ---
-    with st.container():
-        # Slightly overlap upward into lineup space
-        st.markdown(
-            """
-            <div style='margin-top:-2rem;'></div>
-            """,
-            unsafe_allow_html=True,
-        )
+    # # --- Bet Entry Section directly below lineups ---
+    # with st.container():
+    #     # Slightly overlap upward into lineup space
+    #     st.markdown(
+    #         """
+    #         <div style='margin-top:-2rem;'></div>
+    #         """,
+    #         unsafe_allow_html=True,
+    #     )
 
-        bet_col1, _ = st.columns([2, 1])  # span under first two columns
-        with bet_col1:
-            show_bet_input_area()
+    #     bet_col1, _ = st.columns([2, 1])  # span under first two columns
+    #     with bet_col1:
+    #         show_bet_input_area()
 
 
 # helper to render a Lineup
@@ -294,26 +307,26 @@ def show_games(week, bet_dict):
 
 def show_bet_input_area():
     team = st.session_state.get("selected_team")
-    st.markdown("<hr style='margin-top:-57px; margin-bottom:4px;'>", unsafe_allow_html=True)
+    st.markdown("<hr style='margin-top:2px; margin-bottom:4px;'>", unsafe_allow_html=True)
 
     if not team:
         # Move info box up and add "Clear Bets" button on right
         st.markdown("""
         <style>
         div[data-testid="stAlert"] {
-            margin-top: -80px !important;
+            margin-top: -35px !important;
             width: 85% !important;       /* ✅ change width here */
             margin-left: 0px !important; /* optional: move slightly right */
         }
         </style>
 
 
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-right:12px; margin-top:-52px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-right:12px; margin-top:0px;">
             <div style="flex:1;">
                 <div id="info-box"></div>
             </div>
             <div>
-                <form action="" method="get" style="margin:0;">
+                <form action="" method="get" style="margin-top:0px;">
                     <input type="hidden" name="clear_bets" value="1">
                     <button type="submit"
                         style="background-color:#FF4B4B; color:white; border:none;

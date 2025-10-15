@@ -111,7 +111,7 @@ def build_players(roster, players_data):
                                 players_data[player]["team"],
                                 players_data[player]["number"]))
         except KeyError:
-            players.append(Player("---", "---", "--", "None", 0, "--", 0))
+            players.append(Player("---", "---", "None", "None", 0, "--", 0))
     return players
 
 def pull_player_metadata(json_file, datefile):
@@ -227,6 +227,7 @@ class Lineup:
             else:
                 sorted_flex = bubble_sort_players(flexlist)
                 newlist.extend(sorted_flex)
+                newlist.extend(self.get_players_by_pos("None"))  # add potential None players to the end
         self.player_list = newlist
 
 
