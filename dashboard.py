@@ -11,12 +11,22 @@ from datetime import datetime
 
 
 def main():
+    save_state_filename = 'save_state.json'
     league_id = "1180303931006689280"  # FFF league
     username = "TitsBon"
-    week = 6
-    my_lineup, opp_lineup = pull_lineup(league_id, username, week)
+    if "selected_week" not in st.session_state:
+        if not os.path.exists(save_state_filename):
+            with open(save_state_filename, 'w') as f:
+                json.dump(dict({'current_week': 1}), f, indent=4)
+                st.session_state["selected_week"] = 1
+        else:
+            with open(save_state_filename, 'r') as f:
+                save_state = json.load(f)
+            st.session_state["selected_week"] = save_state["current_week"]
+    # week = st.session_state["selected_week"]
+    my_lineup, opp_lineup = pull_lineup(league_id, username, st.session_state["selected_week"])
 
-    bet_file = f'bets/wk{week}.json'
+    bet_file = f'bets/wk{st.session_state["selected_week"]}.json'
 
     st.session_state.bets = initialize_bet_dict(bet_file)
 
@@ -86,16 +96,29 @@ def main():
     # --- Title and Menu ---
     top_left, top_right = st.columns([3, 1])
     with top_left:
-        st.title(f"Football Sunday Dashboard - Week {week}")
+        st.title(f"Football Sunday Dashboard - Week {st.session_state["selected_week"]}")
     with top_right:
         st.write("")
         st.write("")
-        st.selectbox(
-            "Menu",
-            ["Change Week", "Other"],
-            index=0,
+
+        selected_week = st.selectbox(
+            "Select Week",
+            options=[f"Week {i}" for i in range(1, 19)],
+            index=st.session_state["selected_week"] - 1,
             label_visibility="collapsed",
         )
+
+        new_week = int(selected_week.split()[-1])
+
+        if new_week != st.session_state["selected_week"]:
+            with open(save_state_filename, 'r+') as f:
+                save_state = json.load(f)
+                save_state["current_week"] = new_week
+                f.seek(0)              # move pointer to start of file
+                json.dump(save_state, f, indent=4)
+                f.truncate()
+            st.session_state["selected_week"] = new_week
+            st.rerun()
 
     # --- Layout Columns ---
     col1, col2, col3 = st.columns(3)
@@ -104,7 +127,7 @@ def main():
     with col2:
         show_lineup(opp_lineup, my_lineup)
     with col3:
-        show_games(week, st.session_state.bets)
+        show_games(st.session_state["selected_week"], st.session_state.bets)
 
     # --- Bet Entry Section directly below lineups ---
     with st.container():
@@ -185,7 +208,7 @@ def show_games(week, bet_dict):
     for game in games:
         away_team = game["away_team"]; home_team = game["home_team"]
         away_color = team_colors.get(away_team, "#888"); home_color = team_colors.get(home_team, "#888")
-        status = f"Q{game['quarter']} {game['clock']}" if game["status"] == "In Progress" else game["status"]
+        status = f"Q{game['quarter']} {game['clock']}" if game["status"] == "In Progress" else "TBD" if game["status"] == "Scheduled" else game["status"]
         away_score = f"{int(game['away_score']):>2}"; home_score = f"{int(game['home_score']):>2}"
 
         def construct_bet_string(team, spread):

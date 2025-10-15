@@ -102,13 +102,16 @@ def build_players(roster, players_data):
     starter_ids = roster['starters']    # list of player IDs
     players = []
     for player in starter_ids:
-        players.append(Player(players_data[player]["first_name"], 
-                              players_data[player]["last_name"], 
-                              players_data[player]["position"],
-                              players_data[player]["injury_status"],
-                              roster.get('players_points', {})[player],
-                              players_data[player]["team"],
-                              players_data[player]["number"]))
+        try:
+            players.append(Player(players_data[player]["first_name"], 
+                                players_data[player]["last_name"], 
+                                players_data[player]["position"],
+                                players_data[player]["injury_status"],
+                                roster.get('players_points', {})[player],
+                                players_data[player]["team"],
+                                players_data[player]["number"]))
+        except KeyError:
+            players.append(Player("---", "---", "--", "None", 0, "--", 0))
     return players
 
 def pull_player_metadata(json_file, datefile):
