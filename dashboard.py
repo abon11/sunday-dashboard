@@ -344,7 +344,7 @@ def show_bet_input_area():
         return
 
     st.markdown(f"""
-    <div style="margin-left:6px; margin-top:-63px; font-weight:700; font-size:1.1em;">
+    <div style="margin-left:6px; margin-top:-5px; font-weight:700; font-size:1.1em;">
         Enter the spread for the bet you placed on <span style="color:#0073e6;">{team}</span> (Moneyline=0):
     </div>
     <div style="margin-top:4px; margin-left:6px; display:flex; align-items:center;">
