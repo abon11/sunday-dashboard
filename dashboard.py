@@ -78,6 +78,10 @@ def main():
     elif "select_team" in params:
         st.session_state.selected_team = params["select_team"]
         st.query_params.clear()
+    
+    if "clear_bets" in params:
+        st.session_state.bets = initialize_bet_dict(bet_file, clear=True)
+        st.query_params.clear()
 
     # --- Title and Menu ---
     top_left, top_right = st.columns([3, 1])
@@ -202,7 +206,7 @@ def show_games(week, bet_dict):
         elif bet_dict[home_team][0] is not None:
             bet_string = construct_bet_string(home_team, bet_dict[home_team][0])
         else:
-            bet_string = 'No bets'
+            bet_string = '---'
 
         params = st.query_params
         if "clicked_team" in params:
@@ -270,14 +274,36 @@ def show_bet_input_area():
     st.markdown("<hr style='margin-top:-57px; margin-bottom:4px;'>", unsafe_allow_html=True)
 
     if not team:
-        # inject CSS to lift the info box higher
+        # Move info box up and add "Clear Bets" button on right
         st.markdown("""
         <style>
         div[data-testid="stAlert"] {
-            margin-top: -75px !important;
+            margin-top: -80px !important;
+            width: 85% !important;       /* ✅ change width here */
+            margin-left: 0px !important; /* optional: move slightly right */
         }
         </style>
+
+
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-right:12px; margin-top:-52px;">
+            <div style="flex:1;">
+                <div id="info-box"></div>
+            </div>
+            <div>
+                <form action="" method="get" style="margin:0;">
+                    <input type="hidden" name="clear_bets" value="1">
+                    <button type="submit"
+                        style="background-color:#FF4B4B; color:white; border:none;
+                               border-radius:6px; height:32px; width:100px;
+                               font-weight:600; cursor:pointer;">
+                        Clear Bets
+                    </button>
+                </form>
+            </div>
+        </div>
         """, unsafe_allow_html=True)
+
+        # Render info box in its proper place (fills the left side of flex)
         st.info("Click a team in the game list to start or edit a bet.")
         return
 
@@ -299,9 +325,9 @@ def show_bet_input_area():
     """, unsafe_allow_html=True)
 
 
-def initialize_bet_dict(bet_file):
+def initialize_bet_dict(bet_file, clear=False):
     os.makedirs(os.path.dirname(bet_file), exist_ok=True)
-    if not os.path.exists(bet_file):
+    if not os.path.exists(bet_file) or clear is True:
         # dictionary of a tuple where the first entry is the spread and the second is the datetime it was entered
         bets = {
             "NYG": (None, None), "WSH": (None, None), "DAL": (None, None), "PHI": (None, None),
