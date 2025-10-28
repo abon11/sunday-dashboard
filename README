@@ -1,5 +1,5 @@
 This is the code to what will be the most complete personalized sunday dashboard to have alongside NFL redzone, keeping track of bets, big games, and player props for your fantasy teams, all in one place for easy viewing.
 
-Need `conda install anaconda::streamlit-extras`, `conda install streamlit` in your conda environment.
+Need `conda install streamlit`, `conda install anaconda::streamlit-extras`, `conda install pandas matplotlib`, in your conda environment.
 
 To launch the dashboard, type `streamlit run dashboard.py` into the command line.
