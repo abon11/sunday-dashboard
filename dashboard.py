@@ -7,7 +7,8 @@ from streamlit_extras.stylable_container import stylable_container
 import os
 import json
 from datetime import datetime
-
+import time
+import threading
 
 
 def main():
@@ -122,39 +123,63 @@ def main():
             st.session_state["selected_week"] = new_week
             st.rerun()
 
-    # --- Main layout: left side (lineups + bet) and right side (games) ---
+    # # --- Main layout: left side (lineups + bet) and right side (games) ---
+    # left, right = st.columns([2, 1], gap="medium")
+
+    # # --- LEFT: lineups and bet area grouped together ---
+    # with left:
+    #     # Group both fantasy lineups side by side
+    #     lineup_cols = st.columns(2, gap="medium")
+    #     with lineup_cols[0]:
+    #         show_lineup(my_lineup, opp_lineup)
+    #     with lineup_cols[1]:
+    #         show_lineup(opp_lineup, my_lineup)
+
+    #     # Bet area directly beneath both lineups
+    #     st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+    #     show_bet_input_area()
+
+    # # --- RIGHT: games list ---
+    # with right:
+    #     show_games(st.session_state["selected_week"], st.session_state.bets)
+
     left, right = st.columns([2, 1], gap="medium")
 
-    # --- LEFT: lineups and bet area grouped together ---
     with left:
-        # Group both fantasy lineups side by side
-        lineup_cols = st.columns(2, gap="medium")
-        with lineup_cols[0]:
-            show_lineup(my_lineup, opp_lineup)
-        with lineup_cols[1]:
-            show_lineup(opp_lineup, my_lineup)
-
-        # Bet area directly beneath both lineups
-        st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
-        show_bet_input_area()
-
-    # --- RIGHT: games list ---
+        lineup_placeholder = st.empty()
     with right:
-        show_games(st.session_state["selected_week"], st.session_state.bets)
+        game_placeholder = st.empty()
 
-    # # --- Bet Entry Section directly below lineups ---
-    # with st.container():
-    #     # Slightly overlap upward into lineup space
-    #     st.markdown(
-    #         """
-    #         <div style='margin-top:-2rem;'></div>
-    #         """,
-    #         unsafe_allow_html=True,
-    #     )
+    # intervals (seconds)
+    lineup_interval = 15
+    game_interval = 5
+    last_lineup_update = 0
+    last_game_update = 0
 
-    #     bet_col1, _ = st.columns([2, 1])  # span under first two columns
-    #     with bet_col1:
-    #         show_bet_input_area()
+    while True:
+        now = time.time()
+
+        # Update lineups every 15s
+        if now - last_lineup_update > lineup_interval:
+            my_lineup, opp_lineup = pull_lineup(league_id, username, st.session_state["selected_week"])
+            with lineup_placeholder.container():
+                lineup_cols = st.columns(2, gap="medium")
+                with lineup_cols[0]:
+                    show_lineup(my_lineup, opp_lineup)
+                with lineup_cols[1]:
+                    show_lineup(opp_lineup, my_lineup)
+                # Bet area directly beneath both lineups
+                st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+                show_bet_input_area()
+            last_lineup_update = now
+
+        # Update games every 5s
+        if now - last_game_update > game_interval:
+            with game_placeholder.container():
+                show_games(st.session_state["selected_week"], st.session_state.bets)
+            last_game_update = now
+
+        time.sleep(1)  # loop step
 
 
 # helper to render a Lineup
@@ -227,12 +252,12 @@ def sort_games(games, bet_dict):
         bet_score = get_bet_score(game)
 
         # group order: in-progress → final → TBD
-        if status not in ["Final", "TBD"]:
-            group = 2  # In Progress
+        if status not in ["Final", "Scheduled"]:
+            group = 0  # In Progress
         elif status == "Final":
             group = 1
         else:
-            group = 0  # TBD
+            group = 2  # TBD
 
         # negative bet_score → descending within group
         return (group, -bet_score)
@@ -311,7 +336,14 @@ def show_games(week, bet_dict):
             border_color = "#3ECFDF"
             bg_color = "#f8f8f8"
         else:
-            border_color = "#CFC915"
+            border_color = "#F7F026"
+
+        home_border = "#000000"
+        away_border = "#000000"
+        if game["possession"] == home_team:
+            home_border = "#F7F026"
+        elif game["possession"] == away_team:
+            away_border = "#F7F026"
 
         params = st.query_params
         if "clicked_team" in params:
@@ -335,7 +367,7 @@ def show_games(week, bet_dict):
                     <button type="submit" style="
                         background-color:{away_color};
                         color:white;
-                        border:2px solid black;
+                        border:3px solid {away_border};
                         border-radius:6px;
                         font-weight:700;
                         width:3.8em;
@@ -355,7 +387,7 @@ def show_games(week, bet_dict):
                     <button type="submit" style="
                         background-color:{home_color};
                         color:white;
-                        border:2px solid black;
+                        border:3px solid {home_border};
                         border-radius:6px;
                         font-weight:700;
                         width:3.8em;
@@ -367,7 +399,7 @@ def show_games(week, bet_dict):
                 </form>
             </div>
             <div style="flex:2.0; font-family:monospace; margin-left:10px;">
-            | {status} | {bet_string}
+            {status} | {bet_string}
             </div>
         </div>
         </div>
