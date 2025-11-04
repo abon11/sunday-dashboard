@@ -199,8 +199,9 @@ def show_lineup(lineup, other_lineup):
             <div style="
                 background-color:{color};
                 color:black;
+                border:3px solid #000000;
                 padding:10px 14px;
-                margin-bottom:6px;
+                margin-bottom:2px;
                 border-radius:10px;
                 font-weight:500;
             ">
