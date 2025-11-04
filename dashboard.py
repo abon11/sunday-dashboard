@@ -198,9 +198,52 @@ def diff_color(p_points, op_points):
     cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F63737", "#DCDADA", "#33F333"])
     return mcolors.to_hex(cmap(normalized))
 
+def sort_games(games, bet_dict):
+    def get_bet_score(game):
+        """Return the bet spread value (absolute), default 0 if none."""
+        away_team = game["away_team"]
+        home_team = game["home_team"]
+        if bet_dict[away_team][0] is not None and bet_dict[home_team][0] is not None:
+            # take the more recently placed bet (we could clear the other bet but unnecessary)
+            if bet_dict[away_team][1] >= bet_dict[home_team][1]:
+                current_spread = float(game["away_score"]) - float(game["home_score"])  # this shows us what spread we will cover
+                winning_by = current_spread + float(bet_dict[away_team][0])
+            else:
+                current_spread = float(game["home_score"]) - float(game["away_score"])  # this shows us what spread we will cover
+                winning_by = current_spread + float(bet_dict[home_team][0])
+        elif bet_dict[away_team][0] is not None:
+            current_spread = float(game["away_score"]) - float(game["home_score"])  # this shows us what spread we will cover
+            winning_by = current_spread + float(bet_dict[away_team][0])
+        elif bet_dict[home_team][0] is not None:
+            current_spread = float(game["home_score"]) - float(game["away_score"])  # this shows us what spread we will cover
+            winning_by = current_spread + float(bet_dict[home_team][0])
+        else:
+            winning_by = 0
+        # pick whichever exists, or 0 if none
+        return winning_by
+
+    def sort_key(game):
+        status = game["status"]
+        bet_score = get_bet_score(game)
+
+        # group order: in-progress → final → TBD
+        if status not in ["Final", "TBD"]:
+            group = 2  # In Progress
+        elif status == "Final":
+            group = 1
+        else:
+            group = 0  # TBD
+
+        # negative bet_score → descending within group
+        return (group, -bet_score)
+
+    return sorted(games, key=sort_key)
+
+
 def show_games(week, bet_dict):
     st.subheader("Full Slate")
     games = pull_games(week)
+    games = sort_games(games, bet_dict)
 
     if "selected_team" not in st.session_state:
         st.session_state.selected_team = None
@@ -230,19 +273,45 @@ def show_games(week, bet_dict):
             else:
                 string = f'{team}: {spread:+.1f}'
             return string
+        
+        def compute_score_color(rooting_team_score, against_team_score, spread, status):
+            current_spread = float(rooting_team_score) - float(against_team_score)  # this shows us what spread we will cover
+            winning_by = current_spread + float(spread)
+            if status == "Final":
+                if winning_by > 0:
+                    return "#33F333"
+                else:
+                    return "#F63737"
+            diff = max(-14, min(14, winning_by))  # clamp between -14 and 14
+            normalized = (diff + 14) / 28.0  # map [-14, 14] → [0, 1]
+            cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F63737", "#DCDADA", "#33F333"])
+            return mcolors.to_hex(cmap(normalized))
 
         if bet_dict[away_team][0] is not None and bet_dict[home_team][0] is not None:
             # take the more recently placed bet (we could clear the other bet but unnecessary)
             if bet_dict[away_team][1] >= bet_dict[home_team][1]:
                 bet_string = construct_bet_string(away_team, bet_dict[away_team][0])
+                bg_color = compute_score_color(away_score, home_score, bet_dict[away_team][0], status)
             else:
                 bet_string = construct_bet_string(home_team, bet_dict[home_team][0])
+                bg_color = compute_score_color(home_score, away_score, bet_dict[home_team][0], status)
         elif bet_dict[away_team][0] is not None:
             bet_string = construct_bet_string(away_team, bet_dict[away_team][0])
+            bg_color = compute_score_color(away_score, home_score, bet_dict[away_team][0], status)
         elif bet_dict[home_team][0] is not None:
             bet_string = construct_bet_string(home_team, bet_dict[home_team][0])
+            bg_color = compute_score_color(home_score, away_score, bet_dict[home_team][0], status)
         else:
             bet_string = '---'
+            bg_color = "#f8f8f8"
+        
+        if status == "Final":
+            border_color = "#000000"
+        elif status == "TBD":
+            border_color = "#3ECFDF"
+            bg_color = "#f8f8f8"
+        else:
+            border_color = "#CFC915"
 
         params = st.query_params
         if "clicked_team" in params:
@@ -253,10 +322,10 @@ def show_games(week, bet_dict):
 
         st.markdown(f"""
         <div style="
-            background-color: #f8f8f8;
-            border: 1px solid #ddd;
-            border-radius: 2px;
-            padding: 4px 4px;
+            background-color:{bg_color};
+            border: 2px solid {border_color};
+            border-radius: 4px;
+            padding: 3px 3px;
             margin: 0px;            /* eliminates spacing */
         ">
         <div style="display:flex; align-items:center;">
