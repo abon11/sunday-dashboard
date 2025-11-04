@@ -334,10 +334,10 @@ def show_games(week, bet_dict):
         if status == "Final":
             border_color = "#000000"
         elif status == "TBD":
-            border_color = "#3ECFDF"
+            border_color = "#787878"
             bg_color = "#f8f8f8"
         else:
-            border_color = "#F7F026"
+            border_color = "#3ECFDF"
 
         home_border = "#000000"
         away_border = "#000000"
