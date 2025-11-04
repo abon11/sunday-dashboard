@@ -17,6 +17,15 @@ def pull_games(week):
         comp = e["competitions"][0]
         home = comp["competitors"][0]
         away = comp["competitors"][1]
+        # Default possession = None (for Scheduled/Final games)
+        possession = None
+        if "situation" in comp and comp["situation"]:
+            possession_id = comp["situation"].get("possession")
+            if possession_id == home["id"]:
+                possession = home["team"]["abbreviation"]
+            elif possession_id == away["id"]:
+                possession = away["team"]["abbreviation"]
+
         games.append({
             "home_team": home["team"]["abbreviation"],
             "away_team": away["team"]["abbreviation"],
@@ -24,7 +33,8 @@ def pull_games(week):
             "away_score": int(away["score"]),
             "status": comp["status"]["type"]["description"],
             "quarter": comp["status"]["period"],
-            "clock": comp["status"].get("displayClock", "")
+            "clock": comp["status"].get("displayClock", ""),
+            "possession": possession,  # <-- new field
         })
     return games
 
