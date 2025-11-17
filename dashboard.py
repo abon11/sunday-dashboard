@@ -3,12 +3,10 @@ import pandas as pd
 from sleeper_pull import pull_lineup
 from espn_pull import pull_games
 import matplotlib.colors as mcolors
-from streamlit_extras.stylable_container import stylable_container
 import os
 import json
 from datetime import datetime
 import time
-import threading
 
 
 def main():
@@ -24,8 +22,10 @@ def main():
             with open(save_state_filename, 'r') as f:
                 save_state = json.load(f)
             st.session_state["selected_week"] = save_state["current_week"]
-    # week = st.session_state["selected_week"]
-    my_lineup, opp_lineup = pull_lineup(league_id, username, st.session_state["selected_week"])
+
+    all_data = DataHouse(league_id, username)
+
+    my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
 
     bet_file = f'bets/wk{st.session_state["selected_week"]}.json'
 
@@ -67,32 +67,7 @@ def main():
     """, unsafe_allow_html=True)
 
     params = st.query_params
-
-    # A. Bet submission takes priority
-    if "bet_team" in params and "spread" in params:
-        team = params["bet_team"]
-        try:
-            val = float(params["spread"])
-            spread = round(val * 2) / 2.0  # nearest 0.5
-            print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
-            st.session_state.bets[team] = (spread, datetime.now().timestamp())
-            # save the bets for when refresh happens
-            with open(bet_file, 'w') as f:
-                json.dump(st.session_state.bets, f, indent=4)
-        except ValueError:
-            print(f"Bad spread for {team}: {params['spread']}")
-
-        st.session_state.selected_team = None         # clear the bet UI
-        st.query_params.clear()
-
-    # B. Team selection (from clicking a team button)
-    elif "select_team" in params:
-        st.session_state.selected_team = params["select_team"]
-        st.query_params.clear()
-    
-    if "clear_bets" in params:
-        st.session_state.bets = initialize_bet_dict(bet_file, clear=True)
-        st.query_params.clear()
+    handle_bets(params, bet_file)
 
     # --- Title and Menu ---
     top_left, top_right = st.columns([3, 1])
@@ -123,45 +98,24 @@ def main():
             st.session_state["selected_week"] = new_week
             st.rerun()
 
-    # # --- Main layout: left side (lineups + bet) and right side (games) ---
-    # left, right = st.columns([2, 1], gap="medium")
-
-    # # --- LEFT: lineups and bet area grouped together ---
-    # with left:
-    #     # Group both fantasy lineups side by side
-    #     lineup_cols = st.columns(2, gap="medium")
-    #     with lineup_cols[0]:
-    #         show_lineup(my_lineup, opp_lineup)
-    #     with lineup_cols[1]:
-    #         show_lineup(opp_lineup, my_lineup)
-
-    #     # Bet area directly beneath both lineups
-    #     st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
-    #     show_bet_input_area()
-
-    # # --- RIGHT: games list ---
-    # with right:
-    #     show_games(st.session_state["selected_week"], st.session_state.bets)
-
     left, right = st.columns([2, 1], gap="medium")
-
     with left:
         lineup_placeholder = st.empty()
     with right:
         game_placeholder = st.empty()
 
     # intervals (seconds)
-    lineup_interval = 15
-    game_interval = 5
-    last_lineup_update = 0
-    last_game_update = 0
+    pull_interval = 10
+    last_pull = 0
 
     while True:
         now = time.time()
-
-        # Update lineups every 15s
-        if now - last_lineup_update > lineup_interval:
-            my_lineup, opp_lineup = pull_lineup(league_id, username, st.session_state["selected_week"])
+        # Update lineups every 10s
+        if now - last_pull > pull_interval:
+            my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
+            with game_placeholder.container():
+                games = all_data.get_games(st.session_state["selected_week"])
+                show_games(games, st.session_state.bets)
             with lineup_placeholder.container():
                 lineup_cols = st.columns(2, gap="medium")
                 with lineup_cols[0]:
@@ -171,16 +125,36 @@ def main():
                 # Bet area directly beneath both lineups
                 st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
                 show_bet_input_area()
-            last_lineup_update = now
-
-        # Update games every 5s
-        if now - last_game_update > game_interval:
-            with game_placeholder.container():
-                show_games(st.session_state["selected_week"], st.session_state.bets)
-            last_game_update = now
-
+            last_pull = now
         time.sleep(1)  # loop step
 
+
+def handle_bets(params, bet_file):
+    # A. Bet submission takes priority
+    if "bet_team" in params and "spread" in params:
+        team = params["bet_team"]
+        try:
+            val = float(params["spread"])
+            spread = round(val * 2) / 2.0  # nearest 0.5
+            print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
+            st.session_state.bets[team] = (spread, datetime.now().timestamp())
+            # save the bets for when refresh happens
+            with open(bet_file, 'w') as f:
+                json.dump(st.session_state.bets, f, indent=4)
+        except ValueError:
+            print(f"Bad spread for {team}: {params['spread']}")
+
+        st.session_state.selected_team = None         # clear the bet UI
+        st.query_params.clear()
+
+    # B. Team selection (from clicking a team button)
+    elif "select_team" in params:
+        st.session_state.selected_team = params["select_team"]
+        st.query_params.clear()
+    
+    if "clear_bets" in params:
+        st.session_state.bets = initialize_bet_dict(bet_file, clear=True)
+        st.query_params.clear()
 
 # helper to render a Lineup
 def show_lineup(lineup, other_lineup):
@@ -191,21 +165,75 @@ def show_lineup(lineup, other_lineup):
     lineup.order_list()
     other_lineup.order_list()
 
+    team_colors = get_team_colors()
+
     for p, op in zip(lineup.player_list, other_lineup.player_list):
+        team_color = team_colors.get(p.team, "#888")
         color = diff_color(p.player_points, op.player_points)
-        text_color = "white" if p.player_points - op.player_points < 0 else "black"
+        text_decoration = "none"
+        team_border = '#000000'
+        if p.game_status == 'Final' or p.game_status == 'BYE' or p.game_status == 'Scheduled':
+            box_width = 410
+            box_height = 50
+            margin_left = 20
+            vert_padding = 7
+            margin_bottom = 5
+            margin_top = 3
+            font_weight = 500
+            if p.game_status == 'Scheduled':
+                border_color = "#FFFFFF"
+                color = "#bdbdbd"
+            else:
+                border_color = '#000000'
+        else:
+            box_width = 450
+            box_height = 60
+            margin_left = 0
+            vert_padding = 10
+            margin_bottom = 2
+            margin_top = 0
+            font_weight = 700
+            if p.possession is True:
+                team_border = "#F7F026"
+                text_decoration = "underline"
+            else:
+                border_color = '#000000'
         st.markdown(
             f"""
             <div style="
                 background-color:{color};
                 color:black;
-                border:3px solid #000000;
-                padding:10px 14px;
-                margin-bottom:2px;
+                border:3px solid {border_color};
+                padding:{vert_padding}px 14px;
+                margin-bottom:{margin_bottom}px;
+                margin-top:{margin_top}px;
+                width:{box_width}px;
+                max-height:{box_height}px;
+                margin-left:{margin_left}px;
                 border-radius:10px;
                 font-weight:500;
+                align-items:center;
             ">
-                <b>{p.first_name} {p.last_name}</b> ({p.team} {p.position}) - {p.player_points:.1f} pts
+                <div style="display:flex; align-items:center; flex-wrap:wrap;">
+                    <div style="
+                        background-color:{team_color};
+                        color:white;
+                        border:3px solid {team_border};
+                        border-radius:6px;
+                        font-weight:700;
+                        width:3.2em;
+                        height:1.6em;
+                        display:flex;
+                        align-items:center;
+                        justify-content:center;
+                        margin-right:8px;
+                    ">
+                        {p.team}
+                    </div>
+                    <div style="text-decoration:{text_decoration}; font-weight:{font_weight};">
+                        {p.first_name} {p.last_name} ({p.position}) - {p.player_points:.1f} pts
+                    </div>
+                </div>
             </div>
             """,
             unsafe_allow_html=True
@@ -265,17 +293,7 @@ def sort_games(games, bet_dict):
 
     return sorted(games, key=sort_key)
 
-
-def show_games(week, bet_dict):
-    st.subheader("Full Slate")
-    games = pull_games(week)
-    games = sort_games(games, bet_dict)
-
-    if "selected_team" not in st.session_state:
-        st.session_state.selected_team = None
-    if "bets" not in st.session_state:
-        st.session_state.bets = {}
-
+def get_team_colors():
     team_colors = {
         "NYG": "#003C7E", "WSH": "#773141", "DAL": "#041E42", "PHI": "#004C54",
         "BUF": "#00338D", "MIA": "#008E97", "NYJ": "#125740", "NE": "#002244",
@@ -286,6 +304,20 @@ def show_games(week, bet_dict):
         "CAR": "#0085CA", "ATL": "#A71930", "NO": "#D3BC8D", "TB": "#D50A0A",
         "IND": "#002C5F", "TEN": "#4B92DB", "HOU": "#03202F", "JAX": "#006778",
     }
+    return team_colors
+
+
+def show_games(games, bet_dict):
+    st.subheader("Full Slate")
+    # games = pull_games(week)
+    games = sort_games(games, bet_dict)
+
+    if "selected_team" not in st.session_state:
+        st.session_state.selected_team = None
+    if "bets" not in st.session_state:
+        st.session_state.bets = {}
+
+    team_colors = get_team_colors()
 
     for game in games:
         away_team = game["away_team"]; home_team = game["home_team"]
@@ -329,15 +361,13 @@ def show_games(week, bet_dict):
             bg_color = compute_score_color(home_score, away_score, bet_dict[home_team][0], status)
         else:
             bet_string = '---'
-            bg_color = "#f8f8f8"
+            bg_color = "#bdbdbd"
         
-        if status == "Final":
-            border_color = "#000000"
-        elif status == "TBD":
-            border_color = "#787878"
-            bg_color = "#f8f8f8"
-        else:
-            border_color = "#3ECFDF"
+        border_color = "#000000"
+        if status == "TBD":
+            bg_color = "#bdbdbd"
+            border_color = "#FFFFFF"
+
 
         home_border = "#000000"
         away_border = "#000000"
@@ -353,13 +383,35 @@ def show_games(week, bet_dict):
             st.session_state.selected_team = clicked
             st.query_params.clear()  # reset after handling
 
+        if game["status"] == "In Progress":
+            margin_bottom = 0
+            margin_top = 0
+            box_width = 460
+            box_height = 50
+            margin_left = 0
+            border_thickness = 3
+            vert_padding = 3
+        else:
+            margin_bottom = 1
+            margin_top = 1
+            box_width = 430
+            box_height = 40
+            margin_left = 15
+            border_thickness = 3
+            vert_padding = 1
+
         st.markdown(f"""
         <div style="
             background-color:{bg_color};
-            border: 2px solid {border_color};
+            border: {border_thickness}px solid {border_color};
             border-radius: 4px;
-            padding: 3px 3px;
+            padding: {vert_padding}px 3px;
             margin: 0px;            /* eliminates spacing */
+            margin-bottom:{margin_bottom}px;
+            margin-top:{margin_top}px;
+            width:{box_width}px;
+            max-height:{box_height}px;
+            margin-left:{margin_left}px;
         ">
         <div style="display:flex; align-items:center;">
             <div style="flex:0.4;">
@@ -484,6 +536,32 @@ def initialize_bet_dict(bet_file, clear=False):
             bets = json.load(f)
 
     return bets
+
+
+class DataHouse:
+    def __init__(self, league_id, username):
+        self.league_id = league_id
+        self.username = username
+
+        self.cached_mylineup = None
+        self.cached_opplineup = None
+
+        self.cached_games = None
+        self.cached_games_week = None
+
+    def get_lineups(self, week):
+        mylineup, opplineup = pull_lineup(self.league_id, self.username, week)
+        if self.cached_games is not None and self.cached_games_week == week:
+            mylineup.assign_game_status(self.cached_games)
+            opplineup.assign_game_status(self.cached_games)
+        self.cached_mylineup = mylineup
+        self.cached_opplineup = opplineup
+        return mylineup, opplineup
+
+    def get_games(self, week):
+        self.cached_games = pull_games(week)
+        self.cached_games_week = week
+        return self.cached_games
 
 
 if __name__ == "__main__":

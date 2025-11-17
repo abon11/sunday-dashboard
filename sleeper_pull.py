@@ -103,12 +103,17 @@ def build_players(roster, players_data):
     players = []
     for player in starter_ids:
         try:
+            # make espn and sleeper agree
+            if players_data[player]["team"] == 'WAS':
+                team = 'WSH'
+            else:
+                team = players_data[player]["team"]
             players.append(Player(players_data[player]["first_name"], 
                                 players_data[player]["last_name"], 
                                 players_data[player]["position"],
                                 players_data[player]["injury_status"],
                                 roster.get('players_points', {})[player],
-                                players_data[player]["team"],
+                                team,
                                 players_data[player]["number"]))
         except KeyError:
             players.append(Player("---", "---", "None", "None", 0, "--", 0))
@@ -176,6 +181,8 @@ class Player:
         self.player_points = player_points
         self.team = team
         self.number = number
+        self.game_status = None
+        self.possession = None
 
     def __str__(self):
         return f'{self.team} {self.position} - {self.first_name} {self.last_name}: {self.player_points} pts.'
@@ -230,6 +237,27 @@ class Lineup:
                 newlist.extend(self.get_players_by_pos("None"))  # add potential None players to the end
         self.player_list = newlist
 
+    def assign_game_status(self, games):
+        """
+        Given a list of game dictionaries (each with home_team, away_team, status, etc),
+        updates each player's .game_status and .possession based on their team's current game.
+        """
+        # Precompute lookup table for O(1) access
+        team_to_game = {}
+        for g in games:
+            team_to_game[g["home_team"]] = g
+            team_to_game[g["away_team"]] = g
+
+        for player in self.player_list:
+            game = team_to_game.get(player.team)
+            if game:
+                player.possession = False
+                player.game_status = game["status"]
+                if game['possession'] == player.team:
+                    player.possession = True
+            else:
+                player.game_status = "BYE"
+                player.possession = None
 
 
     def get_players_by_pos(self, pos):
