@@ -11,20 +11,60 @@ import time
 
 def main():
     save_state_filename = 'save_state.json'
-    league_id = "1180303931006689280"  # FFF league
+    # league_id = "1180303931006689280"  # FFF league
     username = "TitsBon"
+
+    # --- Load saved state or initialize default ---
+    if not os.path.exists(save_state_filename):
+        with open(save_state_filename, 'w') as f:
+            json.dump({"current_week": 1, "league_id": ""}, f, indent=4)
+
+    with open(save_state_filename, 'r') as f:
+        save_state = json.load(f)
+
+    # --- Initialize week if not in session ---
     if "selected_week" not in st.session_state:
-        if not os.path.exists(save_state_filename):
-            with open(save_state_filename, 'w') as f:
-                json.dump(dict({'current_week': 1}), f, indent=4)
-                st.session_state["selected_week"] = 1
-        else:
-            with open(save_state_filename, 'r') as f:
+        st.session_state["selected_week"] = save_state.get("current_week", 1)
+
+    # --- Initialize league_id if not in session ---
+    if "league_id" not in st.session_state:
+        st.session_state["league_id"] = save_state.get("league_id", "")
+
+    # --- Use the league_id from session (may be empty initially) ---
+    league_id = st.session_state["league_id"]
+
+    # --- Instantiate the data manager only if league_id exists ---
+    if league_id:
+        all_data = DataHouse(league_id, username)
+        my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
+    else:
+        st.markdown("### Enter League ID")
+        st.info("No league currently loaded. Please enter a League ID below to continue.")
+
+        new_league = st.text_input(
+            "League ID",
+            value="",
+            placeholder="Enter your Sleeper League ID",
+            label_visibility="collapsed",
+            key="league_input_init"
+        )
+
+        if new_league.strip():
+            # Save it immediately once user enters something
+            st.session_state["league_id"] = new_league.strip()
+            with open(save_state_filename, 'r+') as f:
                 save_state = json.load(f)
-            st.session_state["selected_week"] = save_state["current_week"]
+                save_state["league_id"] = new_league.strip()
+                f.seek(0)
+                json.dump(save_state, f, indent=4)
+                f.truncate()
+
+            st.success("League ID saved! Loading dashboard...")
+            st.rerun()
+        else:
+            st.stop()
 
     all_data = DataHouse(league_id, username)
-
     my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
 
     bet_file = f'bets/wk{st.session_state["selected_week"]}.json'
@@ -79,20 +119,89 @@ def main():
         st.write("")
         st.write("")
 
-        selected_week = st.selectbox(
-            "Select Week",
-            options=[f"Week {i}" for i in range(1, 19)],
-            index=st.session_state["selected_week"] - 1,
-            label_visibility="collapsed",
-        )
+        # --- Load or set default league_id ---
+        if "league_id" not in st.session_state:
+            if os.path.exists(save_state_filename):
+                with open(save_state_filename, 'r') as f:
+                    save_state = json.load(f)
+                league_id = save_state.get("league_id", league_id)
+            st.session_state["league_id"] = league_id
 
+        # --- Styling: make compact and side-by-side ---
+        st.markdown("""
+        <style>
+            div[data-baseweb="select"] {
+                max-width: 160px !important;
+                min-width: 160px !important;
+                margin-left: -120px !important;
+                display: inline-block !important;
+                border-radius:10px;
+                border:2px solid black;
+            }
+            div[data-testid="stTextInput"] {
+                max-width: 200px !important;
+                min-width: 200px !important;
+                margin-left: -60px !important;
+                display: inline-block !important;
+                margin-right: 6px !important;
+                border-radius:10px;
+                border:2px solid black;
+            }
+            div[data-testid="stButton"] > button {
+                height: 1.8em !important;
+                font-size: 0.8em !important;
+                padding: 0px 8px !important;
+                background-color:#0073e6;
+                color: white;
+                border:2px solid black;
+            }
+            div[data-testid="column"] {
+                display: flex;
+                align-items: center;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # --- Compact layout for week + league input + button ---
+        col1, col2, col3 = st.columns([1, 1.3, 0.6], vertical_alignment="center")
+
+        with col1:
+            selected_week = st.selectbox(
+                "Select Week",
+                options=[f"Week {i}" for i in range(1, 19)],
+                index=st.session_state["selected_week"] - 1,
+                label_visibility="collapsed",
+                key="week_select"
+            )
+
+        with col2:
+            new_league = st.text_input(
+                "League ID",
+                value=st.session_state["league_id"],
+                label_visibility="collapsed",
+                placeholder="League ID",
+                key="league_input"
+            )
+
+        with col3:
+            if st.button("Set", use_container_width=True):
+                if new_league.strip():
+                    st.session_state["league_id"] = new_league.strip()
+                    with open(save_state_filename, 'r+') as f:
+                        save_state = json.load(f)
+                        save_state["league_id"] = new_league.strip()
+                        f.seek(0)
+                        json.dump(save_state, f, indent=4)
+                        f.truncate()
+                    st.rerun()
+
+        # --- Handle week switching ---
         new_week = int(selected_week.split()[-1])
-
         if new_week != st.session_state["selected_week"]:
             with open(save_state_filename, 'r+') as f:
                 save_state = json.load(f)
                 save_state["current_week"] = new_week
-                f.seek(0)              # move pointer to start of file
+                f.seek(0)
                 json.dump(save_state, f, indent=4)
                 f.truncate()
             st.session_state["selected_week"] = new_week
@@ -112,10 +221,10 @@ def main():
         now = time.time()
         # Update lineups every 10s
         if now - last_pull > pull_interval:
-            my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
             with game_placeholder.container():
                 games = all_data.get_games(st.session_state["selected_week"])
                 show_games(games, st.session_state.bets)
+            my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
             with lineup_placeholder.container():
                 lineup_cols = st.columns(2, gap="medium")
                 with lineup_cols[0]:
