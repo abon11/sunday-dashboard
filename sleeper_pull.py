@@ -2,15 +2,18 @@ import requests
 import json
 from datetime import datetime
 import os
+import threading
 import time
 
 API = 'https://api.sleeper.app/v1'
 STATIC_TTL = 3600  # seconds to reuse league info that basically never changes mid-slate (rosters, users)
+LIVE_TTL = 8       # seconds to reuse the live pulls (matchups, stats), so everyone on the dashboard shares one pull
 PLAYER_FIELDS = ("first_name", "last_name", "position", "injury_status", "team", "number")
 
 _session = requests.Session()  # one connection reused for every call instead of a new handshake each time
-_response_cache = {}           # url -> (time pulled, json)
+_response_cache = {}           # url -> (time to drop it, json)
 _players_cache = {"date": None, "data": None}
+_players_lock = threading.Lock()  # so two people loading at once don't both pull (and both write) the player file
 _projection_cache = {}         # (league_id, week) -> (time pulled, {player_id: projected points})
 PROJECTION_POSITIONS = ("QB", "RB", "WR", "TE", "K", "DEF")
 IDP_POSITIONS = ("DL", "LB", "DB")
@@ -43,15 +46,25 @@ def _get(url, ttl=0):
     """
     now = time.time()
     cached = _response_cache.get(url)
-    if ttl and cached and now - cached[0] < ttl:
+    if ttl and cached and cached[0] > now:
         return cached[1]
     resp = _session.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     if ttl:
-        _response_cache[url] = (now, data)
+        for old_url in [u for u, (expires, _) in _response_cache.items() if expires <= now]:
+            _response_cache.pop(old_url, None)  # so the cache doesn't grow forever
+        _response_cache[url] = (now + ttl, data)
     return data
 
+
+def current_nfl_season():
+    """The NFL season going on right now, e.g. 2026."""
+    try:
+        return int(_get(f'{API}/state/nfl', ttl=STATIC_TTL)['season'])
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        now = datetime.now()
+        return now.year if now.month >= 3 else now.year - 1
 
 def league_season(league_id):
     """The season (e.g. 2026) a league belongs to. Falls back to the current NFL season if the league can't be read."""
@@ -59,11 +72,7 @@ def league_season(league_id):
         return int(_get(f'{API}/league/{league_id}', ttl=STATIC_TTL)['season'])
     except (requests.RequestException, ValueError, KeyError, TypeError):
         pass
-    try:
-        return int(_get(f'{API}/state/nfl', ttl=STATIC_TTL)['season'])
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        now = datetime.now()
-        return now.year if now.month >= 3 else now.year - 1
+    return current_nfl_season()
 
 def current_nfl_week():
     """The week sleeper says the NFL season is in right now (1 if it can't be reached)."""
@@ -122,7 +131,7 @@ def pull_lineup(league_id, username, week, roster='both'):
     stats, scoring = get_stats(league_id, week)
 
     # --- Matchup info for given week (live points) ---
-    matchup_data = _get(f'{API}/league/{league_id}/matchups/{week}')
+    matchup_data = _get(f'{API}/league/{league_id}/matchups/{week}', ttl=LIVE_TTL)
     user_matchup = next((m for m in matchup_data or [] if m['roster_id'] == my_roster_id), None)
     if user_matchup is None:
         raise ValueError(f"No matchup found for {username} in week {week}.")
@@ -164,6 +173,8 @@ def get_projections(league_id, week):
     cached = _projection_cache.get((league_id, week))
     if cached and time.time() - cached[0] < STATIC_TTL:
         return cached[1]
+    for old_key in [k for k, (pulled, _) in _projection_cache.items() if time.time() - pulled >= STATIC_TTL]:
+        _projection_cache.pop(old_key, None)  # so the cache doesn't grow forever
     try:
         league = _get(f'{API}/league/{league_id}', ttl=STATIC_TTL)
         scoring = league.get('scoring_settings') or {}
@@ -184,12 +195,13 @@ def get_stats(league_id, week):
     """
     Returns ({player_id: {stat: value}}, the league's scoring settings) for the week, which is what a player's
     points are made of. Like the projections this endpoint isn't in sleeper's public docs, so a failure just
-    means no breakdowns. It is pulled fresh every time since the stats are live.
+    means no breakdowns. The stats are live, so they are only reused for a few seconds (the pull is the same
+    for every league, so everyone looking at the dashboard shares it).
     """
     try:
         league = _get(f'{API}/league/{league_id}', ttl=STATIC_TTL)
         positions = _stat_positions(league)
-        raw = _get(f'https://api.sleeper.app/stats/nfl/{league["season"]}/{week}?season_type=regular&{positions}')
+        raw = _get(f'https://api.sleeper.app/stats/nfl/{league["season"]}/{week}?season_type=regular&{positions}', ttl=LIVE_TTL)
     except (requests.RequestException, ValueError, KeyError, TypeError) as e:
         print(f"Warning: could not pull stats: {e}")
         return {}, {}
@@ -240,8 +252,10 @@ def pull_player_metadata(json_file, datefile):
     players_data = _get(f'{API}/players/nfl')
     players_data = {pid: {field: p.get(field) for field in PLAYER_FIELDS} for pid, p in players_data.items()}
 
-    with open(json_file, 'w') as f:
+    # written to a temporary file and swapped in, so a crash part way through can't leave a broken file behind
+    with open(json_file + '.tmp', 'w') as f:
         json.dump(players_data, f)
+    os.replace(json_file + '.tmp', json_file)
 
     # Get the current date and time to log it
     current_datetime = datetime.now()
@@ -260,24 +274,34 @@ def get_player_metadata(json_file='players_data.json', datefile='last_pull.txt')
     if _players_cache["date"] == today:
         return _players_cache["data"]
 
-    try:
-        with open(datefile, "r") as file:
-            date_last_pulled = file.readline().strip()
-    except FileNotFoundError:
-        print(f"Warning: The file '{datefile}' was not found. Defaulting to None.")
-        date_last_pulled = "none"
+    with _players_lock:
+        if _players_cache["date"] == today:  # someone else loaded it while we waited for the lock
+            return _players_cache["data"]
 
-    # check the current date against when we last pulled
-    if today != date_last_pulled or not os.path.exists(json_file):
-        # if we pulled more than a day ago, pull it to update (or if the json just doesn't exist)
-        pull_player_metadata(json_file, datefile)
+        try:
+            with open(datefile, "r") as file:
+                date_last_pulled = file.readline().strip()
+        except FileNotFoundError:
+            print(f"Warning: The file '{datefile}' was not found. Defaulting to None.")
+            date_last_pulled = "none"
 
-    with open(json_file, 'r') as f:
-        data = json.load(f)
+        # check the current date against when we last pulled
+        if today != date_last_pulled or not os.path.exists(json_file):
+            # if we pulled more than a day ago, pull it to update (or if the json just doesn't exist)
+            pull_player_metadata(json_file, datefile)
 
-    _players_cache["date"] = today
-    _players_cache["data"] = data
-    return data
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+        except ValueError:
+            # the saved file is unreadable, so get a fresh one
+            pull_player_metadata(json_file, datefile)
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+
+        _players_cache["date"] = today
+        _players_cache["data"] = data
+        return data
 
 
 class Player:

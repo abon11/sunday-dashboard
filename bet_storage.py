@@ -19,6 +19,7 @@ import streamlit as st
 SHEET_TAB = "bets"
 SHEET_COLUMNS = ["user", "league", "season", "week", "team", "spread", "placed_at"]
 SHEET_CACHE_SECONDS = 60  # google limits reads to ~60 a minute, so the sheet is re-read at most this often
+SHEET_TIMEOUT_SECONDS = 10  # give up on google after this long rather than leaving everybody's page waiting
 
 _lock = threading.Lock()
 # every bet row in the sheet as a dictionary of column -> value, shared by everyone using the app
@@ -35,8 +36,14 @@ def load_bets(username, season, week):
         return _load_file(week)
     with _lock:
         rows = _sheet_rows(worksheet)
-    return {row["team"]: (float(row["spread"]), float(row["placed_at"]))
-            for row in rows if _is_mine(row, username, season, week)}
+    bets = {}
+    for row in rows:
+        if _is_mine(row, username, season, week):
+            try:
+                bets[str(row["team"])] = (float(row["spread"]), float(row["placed_at"] or 0))
+            except (TypeError, ValueError):
+                pass  # a row someone typed something odd into by hand shouldn't break everyone else's bets
+    return bets
 
 def save_bets(username, league_id, season, week, bets):
     """Replaces this person's bets for the week with the given dictionary."""
@@ -48,24 +55,34 @@ def save_bets(username, league_id, season, week, bets):
     with _lock:
         # always work from a fresh read, the row numbers have to be right to delete the old rows
         rows = _sheet_rows(worksheet, fresh=True)
+        header = _sheet_cache["header"]
         old_rows = [i for i, row in enumerate(rows) if _is_mine(row, username, season, week)]
         new_rows = [{"user": username.lower(), "league": str(league_id), "season": int(season), "week": int(week),
                      "team": team, "spread": spread, "placed_at": placed_at}
                     for team, (spread, placed_at) in bets.items()]
-        if old_rows:
-            # bottom up so deleting one row doesn't move the ones still to be deleted (+1 for the header row)
-            worksheet.spreadsheet.batch_update({"requests": [
-                {"deleteDimension": {"range": {"sheetId": worksheet.id, "dimension": "ROWS",
-                                               "startIndex": i + 1, "endIndex": i + 2}}}
-                for i in sorted(old_rows, reverse=True)
-            ]})
+
+        # The old rows coming out and the new rows going in are sent as one request, which google applies all
+        # or nothing. So a failure half way can't leave someone with their old bets deleted and nothing saved.
+        # Deleted bottom up so removing one row doesn't move the ones still to be removed (+1 for the header row).
+        requests = [{"deleteDimension": {"range": {"sheetId": worksheet.id, "dimension": "ROWS",
+                                                   "startIndex": i + 1, "endIndex": i + 2}}}
+                    for i in sorted(old_rows, reverse=True)]
         if new_rows:
-            # written in whatever order the sheet's columns are in. RAW keeps the long league id as text
-            header = _sheet_cache["header"]
-            worksheet.append_rows([[row.get(column, "") for column in header] for row in new_rows],
-                                  value_input_option="RAW")
+            # written in whatever order the sheet's columns are in. Text stays text, so the long league id is kept exact
+            requests.append({"appendCells": {
+                "sheetId": worksheet.id,
+                "fields": "userEnteredValue",
+                "rows": [{"values": [_cell(row.get(column, "")) for column in header]} for row in new_rows],
+            }})
+        if requests:
+            worksheet.spreadsheet.batch_update({"requests": requests})
         _sheet_cache["rows"] = [row for i, row in enumerate(rows) if i not in set(old_rows)] + new_rows
         _sheet_cache["pulled"] = time.time()
+
+def _cell(value):
+    if isinstance(value, (int, float)):
+        return {"userEnteredValue": {"numberValue": value}}
+    return {"userEnteredValue": {"stringValue": str(value)}}
 
 
 ######################
@@ -82,12 +99,24 @@ def _worksheet():
         return None  # no secrets file at all
     import gspread  # only needed when the sheet is used
     client = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    client.set_timeout(SHEET_TIMEOUT_SECONDS)
     return client.open_by_key(st.secrets["bets_sheet_id"]).worksheet(SHEET_TAB)
 
 def _sheet_rows(worksheet, fresh=False):
-    """All the bet rows in the sheet (without the header). Call with _lock held."""
-    if fresh or _sheet_cache["rows"] is None or time.time() - _sheet_cache["pulled"] > SHEET_CACHE_SECONDS:
-        values = worksheet.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    """
+    All the bet rows in the sheet (without the header). Call with _lock held.
+    If google can't be reached for a routine re-read we keep showing the copy we already have (and try again in a
+    few seconds) rather than making everyone's bets vanish. A fresh read, which saving needs, always raises.
+    """
+    expired = _sheet_cache["rows"] is None or time.time() - _sheet_cache["pulled"] > SHEET_CACHE_SECONDS
+    if fresh or expired:
+        try:
+            values = worksheet.get_all_values(value_render_option="UNFORMATTED_VALUE")
+        except Exception:
+            if fresh or _sheet_cache["rows"] is None:
+                raise
+            _sheet_cache["pulled"] = time.time() - SHEET_CACHE_SECONDS + 10
+            return _sheet_cache["rows"]
         header = [str(column).strip().lower() for column in values[0]] if values else []
         missing = [column for column in SHEET_COLUMNS if column not in header]
         if missing:

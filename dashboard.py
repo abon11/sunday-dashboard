@@ -1,11 +1,13 @@
 import streamlit as st
 import requests
-from sleeper_pull import pull_lineup, current_nfl_week, league_season
+from sleeper_pull import pull_lineup, current_nfl_week, current_nfl_season, league_season
+import espn_fantasy_pull
 from espn_pull import pull_games, pull_live_spreads, EASTERN
 from bet_storage import load_bets, save_bets
 import html
 import math
 import os
+import re
 import json
 from datetime import datetime
 from itertools import zip_longest
@@ -14,6 +16,7 @@ from urllib.parse import urlparse
 SAVE_STATE_FILENAME = 'save_state.json'
 # league_id = "1313968791364849664"  # FFF league
 DEFAULT_USERNAME = "TitsBon"  # only used for a save_state.json from before the username was saved in it
+SITES = {"sleeper": "Sleeper", "espn": "ESPN"}  # the fantasy sites a league can be on
 REFRESH_SECONDS = 10  # how often the live area re-pulls scores
 
 PLAYER_DIFF_SCALE = 10  # fantasy points ahead/behind where a player box is fully green/red
@@ -159,26 +162,38 @@ def main():
     st.markdown(CSS, unsafe_allow_html=True)
 
     # --- Who is looking ---
-    # The sleeper username and league live in the page's url (?user=...&league=...), so everybody has their
-    # own link to bookmark and nobody shares settings. When you run it on your own computer, a link without
-    # them falls back to what was last saved on it. A hosted copy never remembers anyone: a bare link there
-    # always shows the welcome screen.
+    # The fantasy site, league and who you are in it live in the page's url, so everybody has their own link to
+    # bookmark and nobody shares settings:  ?site=sleeper&league=...&user=<sleeper username>
+    #                                       ?site=espn&league=...&team=<espn team id>
+    # When you run it on your own computer, a link without them falls back to what was last saved on it.
+    # A hosted copy never remembers anyone: a bare link there always shows the welcome screen.
     save_state = load_save_state()
     if "selected_week" not in st.session_state:
         # the week last picked on this machine, or the current NFL week for a first visit
         st.session_state["selected_week"] = save_state.get("current_week") or current_nfl_week()
 
-    league_id = st.query_params.get("league") or save_state.get("league_id", "")
-    saved_username = save_state.get("username") or (DEFAULT_USERNAME if save_state.get("league_id") else "")
-    username = st.query_params.get("user") or saved_username
-    if not (username and league_id):
+    params = st.query_params
+    if params.get("league"):
+        site = params.get("site", "sleeper")  # links from before espn was added don't say which site
+        league_id = params.get("league")
+        who = params.get("team" if site == "espn" else "user", "")
+    else:
+        site = save_state.get("site", "sleeper")
+        league_id = save_state.get("league_id", "")
+        if site == "espn":
+            who = save_state.get("team", "")
+        else:
+            who = save_state.get("username") or (DEFAULT_USERNAME if league_id else "")
+
+    if not valid_settings(site, league_id, who):
         st.markdown("### Welcome to the Football Sunday Dashboard")
-        st.info("Enter your Sleeper username and League ID to load your matchup. "
-                "After that, bookmark the page: the link remembers both.")
-        settings_form("settings_form_init", username, league_id)
+        st.info("Pick the site your fantasy league is on and enter your league to load your matchup. "
+                "After that, bookmark the page: the link remembers it.")
+        settings_panel("welcome", site if site in SITES else "sleeper", "", "")
         st.stop()
-    if st.query_params.get("user") != username or st.query_params.get("league") != league_id:
-        st.query_params.update(user=username, league=league_id)
+    link = {"site": site, "league": league_id, "team" if site == "espn" else "user": who}
+    if params.to_dict() != link:
+        params.from_dict(link)
 
     # --- Title and Menu ---
     title_col, week_col, settings_col = st.columns([6, 1.3, 1.2], vertical_alignment="bottom")
@@ -193,10 +208,10 @@ def main():
         )
     with settings_col:
         with st.popover("League", width="stretch"):
-            settings_form("settings_form", username, league_id)
+            settings_panel("settings", site, league_id, who)
     title_col.title(f"Football Sunday Dashboard - Week {st.session_state['selected_week']}")
 
-    live_view(league_id, username, st.session_state["selected_week"])
+    live_view(site, league_id, who, st.session_state["selected_week"])
 
 
 def running_locally():
@@ -220,20 +235,71 @@ def update_save_state(**changes):
     with open(SAVE_STATE_FILENAME, 'w') as f:
         json.dump(save_state, f, indent=4)
 
-def settings_form(key, username, league_id):
-    """Form to enter or change the sleeper username and league. Saving puts them in the url and reloads the data."""
-    with st.form(key, border=False):
-        new_username = st.text_input("Sleeper Username", value=username, placeholder="Your Sleeper username")
-        new_league = st.text_input(
-            "Sleeper League ID",
-            value=league_id,
-            placeholder="The long number in your league's url",
-            help="Open your league on sleeper.com: it is the number at the end of the address.",
-        )
-        if st.form_submit_button("Set", type="primary") and new_username.strip() and new_league.strip():
-            st.query_params.update(user=new_username.strip(), league=new_league.strip())
-            update_save_state(username=new_username.strip(), league_id=new_league.strip())
-            st.rerun()
+def valid_settings(site, league_id, who):
+    """
+    Whether the site, league and person from the link look right. They end up in the addresses we request and
+    in the bets sheet, so anything that isn't a plain id or username is turned away.
+    """
+    if site not in SITES or not str(league_id).isdigit() or len(str(league_id)) > 25:
+        return False
+    if site == "espn":
+        return str(who).isdigit() and len(str(who)) <= 4
+    return re.fullmatch(r"[A-Za-z0-9_.\-]{1,50}", str(who)) is not None
+
+def apply_settings(site, league_id, who):
+    """Puts a new league in the url (and remembers it on your own computer), then reloads with it."""
+    if not valid_settings(site, league_id, who):
+        st.error("That doesn't look right. The league ID is a number, and a Sleeper username has no spaces.")
+        return
+    who_key = "team" if site == "espn" else "user"
+    st.query_params.from_dict({"site": site, "league": league_id, who_key: who})
+    update_save_state(site=site, league_id=league_id, **{"team" if site == "espn" else "username": who})
+    st.rerun()
+
+def settings_panel(key, site, league_id, who):
+    """Where the fantasy site, league and who you are get entered (the welcome screen) or changed (the League button)."""
+    choice = st.radio("Fantasy site", list(SITES), index=list(SITES).index(site), format_func=SITES.get,
+                      horizontal=True, key=f"{key}_site")
+
+    if choice == "sleeper":
+        with st.form(f"{key}_sleeper", border=False):
+            new_username = st.text_input("Sleeper Username", value=who if site == "sleeper" else "",
+                                         placeholder="Your Sleeper username")
+            new_league = st.text_input(
+                "Sleeper League ID",
+                value=league_id if site == "sleeper" else "",
+                placeholder="The long number in your league's url",
+                help="Open your league on sleeper.com: it is the number at the end of the address.",
+            )
+            if st.form_submit_button("Set", type="primary") and new_username.strip() and new_league.strip():
+                apply_settings("sleeper", new_league.strip(), new_username.strip())
+        return
+
+    # ESPN has no public username to find your team by, so it is two steps: the league, then pick your team from it
+    new_league = st.text_input(
+        "ESPN League ID",
+        value=league_id if site == "espn" else "",
+        placeholder="Type the number, then press Enter",
+        help="Open your league on espn.com: it is the number after leagueId= in the address. "
+             "The league has to be viewable to the public (League Manager Tools, Basic Settings).",
+        key=f"{key}_espn_league",
+    ).strip()
+    if not new_league:
+        return
+    if not new_league.isdigit():
+        st.error("The ESPN League ID is a number.")
+        return
+    try:
+        teams = fetch_espn_teams(new_league)
+    except (requests.RequestException, ValueError) as e:
+        st.error(str(e) if isinstance(e, ValueError) else "Couldn't reach ESPN, try again in a moment.")
+        return
+    labels = {str(team_id): f"{name} ({owner})" if owner else name for team_id, name, owner in teams}
+    team_ids = list(labels)
+    new_team = st.selectbox("Your team", team_ids, format_func=labels.get, key=f"{key}_espn_team",
+                            index=team_ids.index(who) if site == "espn" and who in team_ids else 0)
+    if st.button("Set", type="primary", key=f"{key}_espn_set"):
+        apply_settings("espn", new_league, new_team)
 
 
 # The ttl sits just under the refresh interval: each auto refresh pulls fresh data, but reruns caused
@@ -242,9 +308,15 @@ def settings_form(key, username, league_id):
 def fetch_games(week):
     return pull_games(week)
 
-@st.cache_data(ttl=REFRESH_SECONDS - 1, show_spinner=False)
-def fetch_lineups(league_id, username, week):
-    return pull_lineup(league_id, username, week)
+@st.cache_data(ttl=REFRESH_SECONDS - 1, show_spinner=False, max_entries=200)
+def fetch_lineups(site, league_id, who, week):
+    if site == "espn":
+        return espn_fantasy_pull.pull_lineup(league_id, who, week)
+    return pull_lineup(league_id, who, week)
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=200)
+def fetch_espn_teams(league_id):
+    return espn_fantasy_pull.league_teams(league_id)
 
 # The in-game lines take one request per live game, and move slower than the score, so they refresh less often.
 @st.cache_data(ttl=LIVE_SPREAD_SECONDS, show_spinner=False)
@@ -253,40 +325,44 @@ def fetch_live_spreads(week):
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
-def live_view(league_id, username, week):
+def live_view(site, league_id, who, week):
     """
     Everything that updates live. Being a fragment, only this part reruns (every REFRESH_SECONDS, or when
     a bet is saved) - the browser never reloads the page.
     """
     try:
         games = fetch_games(week)
-        my_lineup, opp_lineup = fetch_lineups(league_id, username, week)
+        my_lineup, opp_lineup = fetch_lineups(site, league_id, who, week)
         live_spreads = fetch_live_spreads(week)
-        st.session_state["last_pull"] = (league_id, username, week, games, my_lineup, opp_lineup, live_spreads, datetime.now(EASTERN))
+        st.session_state["last_pull"] = (site, league_id, who, week, games, my_lineup, opp_lineup, live_spreads, datetime.now(EASTERN))
     except (requests.RequestException, ValueError) as e:
         st.warning(f"Couldn't refresh the data, will keep trying: {e}")
         last_pull = st.session_state.get("last_pull")
-        if last_pull is None or last_pull[:3] != (league_id, username, week):
+        if last_pull is None or last_pull[:4] != (site, league_id, who, week):
             return
-    _, _, _, games, my_lineup, opp_lineup, live_spreads, pulled_at = st.session_state["last_pull"]
+    _, _, _, _, games, my_lineup, opp_lineup, live_spreads, pulled_at = st.session_state["last_pull"]
 
     for lineup in (my_lineup, opp_lineup):
         lineup.assign_game_status(games)
         lineup.order_list()
 
+    # Whose bets these are. Sleeper has usernames, so bets follow the person across their leagues. ESPN doesn't
+    # give us one, so there they belong to the team.
+    bet_user = who if site == "sleeper" else f"espn-{league_id}-{who}"
     try:
-        bets = load_bets(username, league_season(league_id), week)
+        bets = load_bets(bet_user, bet_season(site, league_id), week)
     except Exception as e:  # the google sheet can fail in a lot of ways, none of them should take the page down
-        st.warning(f"Couldn't load your bets, will keep trying: {e}")
+        print(f"Could not load bets for {bet_user}: {e}")  # details go to the log, not onto everybody's screen
+        st.warning("Couldn't load your bets, will keep trying.")
         bets = {}
-    if "bet_error" in st.session_state:
-        st.warning(f"That bet change was not saved, try again: {st.session_state.pop('bet_error')}")
+    if st.session_state.pop("bet_error", False):
+        st.warning("That bet change was not saved, try again in a moment.")
 
     left, right = st.columns([5, 3], gap="medium")
     with left:
         st.markdown(matchup_html(my_lineup, opp_lineup), unsafe_allow_html=True)
-        show_bet_form(games, username, league_id, week)
-        st.markdown(MATCHUP_LEGEND, unsafe_allow_html=True)
+        show_bet_form(games, bet_user, site, league_id, week)
+        st.markdown(matchup_legend(site), unsafe_allow_html=True)
     with right:
         st.markdown(slate_html(games, bets, live_spreads), unsafe_allow_html=True)
     st.caption(f"Updates every {REFRESH_SECONDS}s. Last updated {pulled_at.strftime('%-I:%M:%S %p')} ET")
@@ -369,7 +445,8 @@ def breakdown_popup(p):
              '<span class="sd-tip-head">Pts per</span><span class="sd-tip-head">Points</span>']
     # biggest contributions first
     for stat, amount, per, points in sorted(p.breakdown, key=lambda row: -abs(row[3])):
-        label = STAT_LABELS.get(stat, stat.replace("_", " ").title())
+        # sleeper gives stat keys like rush_yd, espn_fantasy_pull already gives readable names
+        label = STAT_LABELS.get(stat) or (stat.replace("_", " ").title() if stat.islower() else stat)
         cells.append(f'<span>{html.escape(label)}</span><span>{amount:g}</span><span>{per:g}</span><span>{points:.2f}</span>')
     cells.append(f'<span class="sd-tip-total">Total</span><span class="sd-tip-total"></span>'
                  f'<span class="sd-tip-total"></span><span class="sd-tip-total">{p.player_points:.2f}</span>')
@@ -391,7 +468,7 @@ def slate_html(games, bets, live_spreads):
         background = ""
         bet_string = ""
         if bet_team is not None:
-            bet_string = f"{bet_team} ML" if spread == 0 else f"{bet_team} {spread:+.1f}"
+            bet_string = f"{html.escape(bet_team)} ML" if spread == 0 else f"{html.escape(bet_team)} {spread:+.1f}"
             if game["state"] == "pre":
                 summary["upcoming"] += 1
             elif game["state"] == "post":
@@ -445,7 +522,10 @@ def slate_html(games, bets, live_spreads):
         f'<div class="sd-slate">{"".join(rows)}</div>{SLATE_LEGEND}'
     )
 
-def show_bet_form(games, username, league_id, week):
+def bet_season(site, league_id):
+    return league_season(league_id) if site == "sleeper" else current_nfl_season()
+
+def show_bet_form(games, bet_user, site, league_id, week):
     teams = [team for game in games for team in (game["away_team"], game["home_team"])]
     opponent = {}
     for game in games:
@@ -460,17 +540,17 @@ def show_bet_form(games, username, league_id, week):
         spread_col.number_input("Spread", value=0.0, step=0.5, format="%.1f", key="bet_spread",
                                 help="The spread you got, like -2.5 or 3.5. Leave at 0 for a moneyline bet.")
         save_col.form_submit_button("Save", type="primary", width="stretch",
-                                    on_click=change_bets, args=("save", username, league_id, week))
+                                    on_click=change_bets, args=("save", bet_user, site, league_id, week))
         remove_col.form_submit_button("Remove", width="stretch", help="Remove the bet on the selected team",
-                                      on_click=change_bets, args=("remove", username, league_id, week))
+                                      on_click=change_bets, args=("remove", bet_user, site, league_id, week))
         clear_col.form_submit_button("Clear", width="stretch", help="Remove every bet this week",
-                                     on_click=change_bets, args=("clear", username, league_id, week))
+                                     on_click=change_bets, args=("clear", bet_user, site, league_id, week))
 
-def change_bets(action, username, league_id, week):
+def change_bets(action, bet_user, site, league_id, week):
     try:
         # if the bets can't be read we stop here, rather than saving over them with an incomplete set
-        season = league_season(league_id)
-        bets = load_bets(username, season, week)
+        season = bet_season(site, league_id)
+        bets = load_bets(bet_user, season, week)
         team = st.session_state.get("bet_team")
         if action == "clear":
             bets = {}
@@ -482,9 +562,10 @@ def change_bets(action, username, league_id, week):
             spread = round(st.session_state["bet_spread"] * 2) / 2.0  # nearest 0.5
             print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
             bets[team] = (spread, datetime.now().timestamp())
-        save_bets(username, league_id, season, week, bets)
+        save_bets(bet_user, league_id, season, week, bets)
     except Exception as e:
-        st.session_state["bet_error"] = str(e)
+        print(f"Could not save bets for {bet_user}: {e}")
+        st.session_state["bet_error"] = True
 
 def active_bet(game, bets):
     """
@@ -564,16 +645,17 @@ def legend_html(title, items):
 
 WIN_BAR_COLORS = {"sd-up": "#1c9a45", "sd-down": "#d64545", "": "#9a9a9a"}
 
-MATCHUP_LEGEND = legend_html("Lineup key", [
-    ('<span class="sd-swatch"></span>', f"Performance relative to the player across from them"),
-    ('<span class="sd-key sd-live" style="background:#e2e2e2;"><span>Bold</span></span>', "Playing right now"),
-    ('<span class="sd-key sd-done" style="background:#e2e2e2;"><span>Faded</span></span>', "Game is final"),
-    ('<span class="sd-key sd-idle">Grey</span>', "Not started, or on bye"),
-    ("🏈", "Their team has the ball"),
-    ("pts", "Hover a player's points for their scoring breakdown"),
-    ("proj", "Projected final: from Sleeper's projections"),
-    ("win %", "Estimated from the projections (not Sleeper's calculation)"),
-])
+def matchup_legend(site):
+    return legend_html("Lineup key", [
+        ('<span class="sd-swatch"></span>', f"Performance relative to the player across from them"),
+        ('<span class="sd-key sd-live" style="background:#e2e2e2;"><span>Bold</span></span>', "Playing right now"),
+        ('<span class="sd-key sd-done" style="background:#e2e2e2;"><span>Faded</span></span>', "Game is final"),
+        ('<span class="sd-key sd-idle">Grey</span>', "Not started, or on bye"),
+        ("🏈", "Their team has the ball"),
+        ("pts", "Hover a player's points for their scoring breakdown"),
+        ("proj", f"Projected final: from {SITES[site]}'s projections"),
+        ("win %", f"Estimated from the projections (not {SITES[site]}'s calculation)"),
+    ])
 
 SLATE_LEGEND = legend_html("Slate key", [
     ('<span class="sd-swatch"></span>', f"Your bet is worse to better than the live spread (full color at {BET_DIFF_SCALE}+ pts)"),
