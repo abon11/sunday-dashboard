@@ -5,6 +5,9 @@ Technically this is unofficial... if we were to commericalize I think we'd have 
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+EASTERN = ZoneInfo("America/New_York")  # all times are shown in Eastern, wherever the dashboard is running
 
 _session = requests.Session()  # reuse one connection across refreshes
 
@@ -103,9 +106,9 @@ def pull_live_spreads(games):
     return spreads
 
 def kickoff_label(iso_date):
-    """Turns espn's UTC kickoff time into local time text like 'Sun 1:00 PM'."""
+    """Turns espn's UTC kickoff time into Eastern time text like 'Sun 1:00 PM'."""
     try:
-        kickoff = datetime.fromisoformat(iso_date.replace("Z", "+00:00")).astimezone()
+        kickoff = datetime.fromisoformat(iso_date.replace("Z", "+00:00")).astimezone(EASTERN)
         return kickoff.strftime("%a %-I:%M %p")
     except (AttributeError, ValueError):
         return "TBD"

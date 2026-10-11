@@ -1,17 +1,19 @@
 import streamlit as st
 import requests
-from sleeper_pull import pull_lineup
-from espn_pull import pull_games, pull_live_spreads
+from sleeper_pull import pull_lineup, current_nfl_week, league_season
+from espn_pull import pull_games, pull_live_spreads, EASTERN
+from bet_storage import load_bets, save_bets
 import html
 import math
 import os
 import json
 from datetime import datetime
 from itertools import zip_longest
+from urllib.parse import urlparse
 
 SAVE_STATE_FILENAME = 'save_state.json'
 # league_id = "1313968791364849664"  # FFF league
-USERNAME = "TitsBon"
+DEFAULT_USERNAME = "TitsBon"  # only used for a save_state.json from before the username was saved in it
 REFRESH_SECONDS = 10  # how often the live area re-pulls scores
 
 PLAYER_DIFF_SCALE = 10  # fantasy points ahead/behind where a player box is fully green/red
@@ -156,22 +158,30 @@ def main():
     st.set_page_config(page_title="Football Sunday Dashboard", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
 
-    # --- Load saved state into the session ---
+    # --- Who is looking ---
+    # The sleeper username and league live in the page's url (?user=...&league=...), so everybody has their
+    # own link to bookmark and nobody shares settings. When you run it on your own computer, a link without
+    # them falls back to what was last saved on it. A hosted copy never remembers anyone: a bare link there
+    # always shows the welcome screen.
     save_state = load_save_state()
     if "selected_week" not in st.session_state:
-        st.session_state["selected_week"] = save_state.get("current_week", 1)
-    if "league_id" not in st.session_state:
-        st.session_state["league_id"] = save_state.get("league_id", "")
+        # the week last picked on this machine, or the current NFL week for a first visit
+        st.session_state["selected_week"] = save_state.get("current_week") or current_nfl_week()
 
-    league_id = st.session_state["league_id"]
-    if not league_id:
-        st.markdown("### Enter League ID")
-        st.info("No league currently loaded. Please enter a League ID below to continue.")
-        league_form("league_form_init")
+    league_id = st.query_params.get("league") or save_state.get("league_id", "")
+    saved_username = save_state.get("username") or (DEFAULT_USERNAME if save_state.get("league_id") else "")
+    username = st.query_params.get("user") or saved_username
+    if not (username and league_id):
+        st.markdown("### Welcome to the Football Sunday Dashboard")
+        st.info("Enter your Sleeper username and League ID to load your matchup. "
+                "After that, bookmark the page: the link remembers both.")
+        settings_form("settings_form_init", username, league_id)
         st.stop()
+    if st.query_params.get("user") != username or st.query_params.get("league") != league_id:
+        st.query_params.update(user=username, league=league_id)
 
     # --- Title and Menu ---
-    title_col, week_col, league_col = st.columns([6, 1.3, 1.2], vertical_alignment="bottom")
+    title_col, week_col, settings_col = st.columns([6, 1.3, 1.2], vertical_alignment="bottom")
     with week_col:
         st.selectbox(
             "Select Week",
@@ -181,36 +191,48 @@ def main():
             key="selected_week",
             on_change=lambda: update_save_state(current_week=st.session_state["selected_week"]),
         )
-    with league_col:
+    with settings_col:
         with st.popover("League", width="stretch"):
-            league_form("league_form")
+            settings_form("settings_form", username, league_id)
     title_col.title(f"Football Sunday Dashboard - Week {st.session_state['selected_week']}")
 
-    live_view(league_id, st.session_state["selected_week"])
+    live_view(league_id, username, st.session_state["selected_week"])
 
+
+def running_locally():
+    """True when the page is being viewed on the computer running it, rather than a hosted copy."""
+    try:
+        return urlparse(st.context.url).hostname in ("localhost", "127.0.0.1")
+    except Exception:
+        return False
 
 def load_save_state():
-    if not os.path.exists(SAVE_STATE_FILENAME):
-        return {"current_week": 1, "league_id": ""}
+    if not running_locally() or not os.path.exists(SAVE_STATE_FILENAME):
+        return {}
     with open(SAVE_STATE_FILENAME, 'r') as f:
         return json.load(f)
 
 def update_save_state(**changes):
+    if not running_locally():
+        return
     save_state = load_save_state()
     save_state.update(changes)
     with open(SAVE_STATE_FILENAME, 'w') as f:
         json.dump(save_state, f, indent=4)
 
-def league_form(key):
+def settings_form(key, username, league_id):
+    """Form to enter or change the sleeper username and league. Saving puts them in the url and reloads the data."""
     with st.form(key, border=False):
+        new_username = st.text_input("Sleeper Username", value=username, placeholder="Your Sleeper username")
         new_league = st.text_input(
             "Sleeper League ID",
-            value=st.session_state["league_id"],
-            placeholder="Enter your Sleeper League ID",
+            value=league_id,
+            placeholder="The long number in your league's url",
+            help="Open your league on sleeper.com: it is the number at the end of the address.",
         )
-        if st.form_submit_button("Set", type="primary") and new_league.strip():
-            st.session_state["league_id"] = new_league.strip()
-            update_save_state(league_id=new_league.strip())
+        if st.form_submit_button("Set", type="primary") and new_username.strip() and new_league.strip():
+            st.query_params.update(user=new_username.strip(), league=new_league.strip())
+            update_save_state(username=new_username.strip(), league_id=new_league.strip())
             st.rerun()
 
 
@@ -231,38 +253,43 @@ def fetch_live_spreads(week):
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
-def live_view(league_id, week):
+def live_view(league_id, username, week):
     """
     Everything that updates live. Being a fragment, only this part reruns (every REFRESH_SECONDS, or when
     a bet is saved) - the browser never reloads the page.
     """
     try:
         games = fetch_games(week)
-        my_lineup, opp_lineup = fetch_lineups(league_id, USERNAME, week)
+        my_lineup, opp_lineup = fetch_lineups(league_id, username, week)
         live_spreads = fetch_live_spreads(week)
-        st.session_state["last_pull"] = (league_id, week, games, my_lineup, opp_lineup, live_spreads, datetime.now())
+        st.session_state["last_pull"] = (league_id, username, week, games, my_lineup, opp_lineup, live_spreads, datetime.now(EASTERN))
     except (requests.RequestException, ValueError) as e:
         st.warning(f"Couldn't refresh the data, will keep trying: {e}")
         last_pull = st.session_state.get("last_pull")
-        if last_pull is None or last_pull[:2] != (league_id, week):
+        if last_pull is None or last_pull[:3] != (league_id, username, week):
             return
-    _, _, games, my_lineup, opp_lineup, live_spreads, pulled_at = st.session_state["last_pull"]
+    _, _, _, games, my_lineup, opp_lineup, live_spreads, pulled_at = st.session_state["last_pull"]
 
     for lineup in (my_lineup, opp_lineup):
         lineup.assign_game_status(games)
         lineup.order_list()
 
-    bet_file = f'bets/wk{week}.json'
-    bets = load_bets(bet_file)
+    try:
+        bets = load_bets(username, league_season(league_id), week)
+    except Exception as e:  # the google sheet can fail in a lot of ways, none of them should take the page down
+        st.warning(f"Couldn't load your bets, will keep trying: {e}")
+        bets = {}
+    if "bet_error" in st.session_state:
+        st.warning(f"That bet change was not saved, try again: {st.session_state.pop('bet_error')}")
 
     left, right = st.columns([5, 3], gap="medium")
     with left:
         st.markdown(matchup_html(my_lineup, opp_lineup), unsafe_allow_html=True)
-        show_bet_form(games, bet_file)
+        show_bet_form(games, username, league_id, week)
         st.markdown(MATCHUP_LEGEND, unsafe_allow_html=True)
     with right:
         st.markdown(slate_html(games, bets, live_spreads), unsafe_allow_html=True)
-    st.caption(f"Updates every {REFRESH_SECONDS}s. Last updated {pulled_at.strftime('%-I:%M:%S %p')}")
+    st.caption(f"Updates every {REFRESH_SECONDS}s. Last updated {pulled_at.strftime('%-I:%M:%S %p')} ET")
 
 
 ######################
@@ -418,7 +445,7 @@ def slate_html(games, bets, live_spreads):
         f'<div class="sd-slate">{"".join(rows)}</div>{SLATE_LEGEND}'
     )
 
-def show_bet_form(games, bet_file):
+def show_bet_form(games, username, league_id, week):
     teams = [team for game in games for team in (game["away_team"], game["home_team"])]
     opponent = {}
     for game in games:
@@ -433,41 +460,31 @@ def show_bet_form(games, bet_file):
         spread_col.number_input("Spread", value=0.0, step=0.5, format="%.1f", key="bet_spread",
                                 help="The spread you got, like -2.5 or 3.5. Leave at 0 for a moneyline bet.")
         save_col.form_submit_button("Save", type="primary", width="stretch",
-                                    on_click=change_bets, args=("save", bet_file))
+                                    on_click=change_bets, args=("save", username, league_id, week))
         remove_col.form_submit_button("Remove", width="stretch", help="Remove the bet on the selected team",
-                                      on_click=change_bets, args=("remove", bet_file))
+                                      on_click=change_bets, args=("remove", username, league_id, week))
         clear_col.form_submit_button("Clear", width="stretch", help="Remove every bet this week",
-                                     on_click=change_bets, args=("clear", bet_file))
+                                     on_click=change_bets, args=("clear", username, league_id, week))
 
-def change_bets(action, bet_file):
-    bets = load_bets(bet_file)
-    team = st.session_state.get("bet_team")
-    if action == "clear":
-        bets = {}
-    elif team is None:
-        return
-    elif action == "remove":
-        bets.pop(team, None)
-    else:
-        spread = round(st.session_state["bet_spread"] * 2) / 2.0  # nearest 0.5
-        print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
-        bets[team] = (spread, datetime.now().timestamp())
-    save_bets(bet_file, bets)
-
-def load_bets(bet_file):
-    """
-    Returns a dictionary of team -> (spread, timestamp it was entered) for every team with a bet on it.
-    """
-    if not os.path.exists(bet_file):
-        return {}
-    with open(bet_file, 'r') as f:
-        bets = json.load(f)
-    return {team: tuple(bet) for team, bet in bets.items() if bet[0] is not None}
-
-def save_bets(bet_file, bets):
-    os.makedirs(os.path.dirname(bet_file), exist_ok=True)
-    with open(bet_file, 'w') as f:
-        json.dump(bets, f, indent=4)
+def change_bets(action, username, league_id, week):
+    try:
+        # if the bets can't be read we stop here, rather than saving over them with an incomplete set
+        season = league_season(league_id)
+        bets = load_bets(username, season, week)
+        team = st.session_state.get("bet_team")
+        if action == "clear":
+            bets = {}
+        elif team is None:
+            return
+        elif action == "remove":
+            bets.pop(team, None)
+        else:
+            spread = round(st.session_state["bet_spread"] * 2) / 2.0  # nearest 0.5
+            print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
+            bets[team] = (spread, datetime.now().timestamp())
+        save_bets(username, league_id, season, week, bets)
+    except Exception as e:
+        st.session_state["bet_error"] = str(e)
 
 def active_bet(game, bets):
     """

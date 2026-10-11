@@ -13,6 +13,14 @@ _response_cache = {}           # url -> (time pulled, json)
 _players_cache = {"date": None, "data": None}
 _projection_cache = {}         # (league_id, week) -> (time pulled, {player_id: projected points})
 PROJECTION_POSITIONS = ("QB", "RB", "WR", "TE", "K", "DEF")
+IDP_POSITIONS = ("DL", "LB", "DB")
+
+# --- how a league's roster slots (the roster_positions list sleeper gives for a league) are read ---
+FLEX_SLOTS = {"FLEX", "SUPER_FLEX", "REC_FLEX", "WRRB_FLEX", "IDP_FLEX"}  # slots more than one position can fill
+BENCH_SLOTS = {"BN", "IR", "TAXI"}
+POSITION_SLOT = {"DE": "DL", "DT": "DL", "NT": "DL", "OLB": "LB", "ILB": "LB",
+                 "CB": "DB", "S": "DB", "SS": "DB", "FS": "DB"}  # player positions that fill a differently named slot
+DEFAULT_ROSTER_POSITIONS = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX"]  # used if a league doesn't list its slots
 
 
 def main():
@@ -45,6 +53,25 @@ def _get(url, ttl=0):
     return data
 
 
+def league_season(league_id):
+    """The season (e.g. 2026) a league belongs to. Falls back to the current NFL season if the league can't be read."""
+    try:
+        return int(_get(f'{API}/league/{league_id}', ttl=STATIC_TTL)['season'])
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pass
+    try:
+        return int(_get(f'{API}/state/nfl', ttl=STATIC_TTL)['season'])
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        now = datetime.now()
+        return now.year if now.month >= 3 else now.year - 1
+
+def current_nfl_week():
+    """The week sleeper says the NFL season is in right now (1 if it can't be reached)."""
+    try:
+        return min(18, max(1, int(_get(f'{API}/state/nfl', ttl=STATIC_TTL)['week'])))
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return 1
+
 def pull_lineup(league_id, username, week, roster='both'):
     """
     This function calls the sleeper api and obtains the roster data. It has the functionality
@@ -71,10 +98,17 @@ def pull_lineup(league_id, username, week, roster='both'):
         raise ValueError("Error: Roster must be either 'both', 'user', or 'opponent'.")
 
     # --- League info that is static during a slate ---
-    rosters = _get(f'{API}/league/{league_id}/rosters', ttl=STATIC_TTL)
+    try:
+        rosters = _get(f'{API}/league/{league_id}/rosters', ttl=STATIC_TTL)
+    except requests.HTTPError:
+        rosters = None  # sleeper answers 404 for a league id that doesn't exist
     if not rosters:
-        raise ValueError(f"No rosters found for league {league_id}.")
-    user_id = _get(f'{API}/user/{username}', ttl=STATIC_TTL)['user_id']
+        raise ValueError(f"Sleeper league '{league_id}' was not found.")
+    user_data = _get(f'{API}/user/{username}', ttl=STATIC_TTL)
+    if not user_data:
+        raise ValueError(f"Sleeper user '{username}' was not found.")
+    user_id = user_data['user_id']
+    roster_positions = (_get(f'{API}/league/{league_id}', ttl=STATIC_TTL) or {}).get('roster_positions')
     users = {u['user_id']: u for u in _get(f'{API}/league/{league_id}/users', ttl=STATIC_TTL)}
     owner_by_roster = {r['roster_id']: r['owner_id'] for r in rosters}
 
@@ -97,7 +131,7 @@ def pull_lineup(league_id, username, week, roster='both'):
         info = users.get(owner_by_roster.get(matchup['roster_id']), {})
         name = display_name or info.get('display_name', info.get('username', '---'))
         team_name = (info.get('metadata') or {}).get('team_name') or info.get('display_name', name)
-        return Lineup(build_players(matchup, players_data, projections, stats, scoring), name, team_name)
+        return Lineup(build_players(matchup, players_data, projections, stats, scoring), name, team_name, roster_positions)
 
     if roster == "user":
         return build_lineup(user_matchup, username)
@@ -107,11 +141,18 @@ def pull_lineup(league_id, username, week, roster='both'):
     opponent_matchup = next((m for m in matchup_data
                              if my_mid is not None and m.get("matchup_id") == my_mid and m["roster_id"] != my_roster_id),
                             None)
-    opponent_lineup = build_lineup(opponent_matchup) if opponent_matchup else Lineup([], "---", "No opponent")
+    opponent_lineup = build_lineup(opponent_matchup) if opponent_matchup else Lineup([], "---", "No opponent", roster_positions)
 
     if roster == "opponent":
         return opponent_lineup
     return build_lineup(user_matchup, username), opponent_lineup
+
+def _stat_positions(league):
+    """Positions to ask sleeper for. The defensive players are only pulled for leagues that start them."""
+    positions = PROJECTION_POSITIONS
+    if any(slot in IDP_POSITIONS or slot == "IDP_FLEX" for slot in league.get('roster_positions') or []):
+        positions += IDP_POSITIONS
+    return '&'.join(f'position[]={pos}' for pos in positions)
 
 def get_projections(league_id, week):
     """
@@ -126,7 +167,7 @@ def get_projections(league_id, week):
     try:
         league = _get(f'{API}/league/{league_id}', ttl=STATIC_TTL)
         scoring = league.get('scoring_settings') or {}
-        positions = '&'.join(f'position[]={pos}' for pos in PROJECTION_POSITIONS)
+        positions = _stat_positions(league)
         raw = _get(f'https://api.sleeper.app/projections/nfl/{league["season"]}/{week}?season_type=regular&{positions}')
     except (requests.RequestException, ValueError, KeyError, TypeError) as e:
         print(f"Warning: could not pull projections: {e}")
@@ -147,7 +188,7 @@ def get_stats(league_id, week):
     """
     try:
         league = _get(f'{API}/league/{league_id}', ttl=STATIC_TTL)
-        positions = '&'.join(f'position[]={pos}' for pos in PROJECTION_POSITIONS)
+        positions = _stat_positions(league)
         raw = _get(f'https://api.sleeper.app/stats/nfl/{league["season"]}/{week}?season_type=regular&{positions}')
     except (requests.RequestException, ValueError, KeyError, TypeError) as e:
         print(f"Warning: could not pull stats: {e}")
@@ -288,10 +329,11 @@ class Lineup:
     This is a full lineup, which consists of a list of players, the team name, the user associated with that
     team, the amount of total points the team has accrued, etc.
     """
-    def __init__(self, player_list, username, team_name):
+    def __init__(self, player_list, username, team_name, roster_positions=None):
         self.player_list = player_list
         self.username = username
         self.team_name = team_name
+        self.roster_positions = roster_positions or DEFAULT_ROSTER_POSITIONS  # the league's slots, in sleeper's order
         self.total_points = self.calc_total_points()
 
     def calc_total_points(self):
@@ -302,26 +344,42 @@ class Lineup:
         """Projected final score. Call assign_game_status first so finished games stop counting."""
         return sum((player.live_projection for player in self.player_list), 0.0)
 
-    def order_list(self, starters={"QB": 1, "RB": 2, "WR": 2, "TE": 1}):
+    def order_list(self):
         """
-        This orders the player list by position and then by points. The top scorers at each position fill the
-        starting slots (starters gives how many per position), everyone left over at those positions goes to
-        the flex spots, and any other positions (K, DEF, empty slots) go at the end.
+        This orders the player list by position and then by points, following the league's own roster slots
+        so it works for any format (superflex, kickers, defenses, IDP...).
+        The top scorers at each position fill that position's starting slots (a league with two RB slots gets
+        its top two RBs, and so on, in the order the league lists them). Everyone left over is playing a flex
+        spot, and they go where the league's first flex slot is, best first. Empty slots go at the end.
         """
         by_points = sorted(self.player_list, key=lambda p: p.player_points, reverse=True)
 
-        newlist = []
+        # how many dedicated slots each position has, e.g. {"QB": 1, "RB": 2, "WR": 2, "TE": 1}
+        slot_counts = {}
+        slots_before_flex = None
+        for slot in self.roster_positions:
+            if slot in FLEX_SLOTS:
+                if slots_before_flex is None:
+                    slots_before_flex = len(slot_counts)
+            elif slot not in BENCH_SLOTS:
+                slot_counts[slot] = slot_counts.get(slot, 0) + 1
+
+        starters = []  # one list of players per position
         flexlist = []
-        for pos, count in starters.items():
-            players = [p for p in by_points if p.position == pos]
-            newlist.extend(players[:count])
+        for slot, count in slot_counts.items():
+            players = [p for p in by_points if POSITION_SLOT.get(p.position, p.position) == slot]
+            starters.append(players[:count])
             flexlist.extend(players[count:])
+        flexlist.extend(p for p in by_points
+                        if POSITION_SLOT.get(p.position, p.position) not in slot_counts and p.position != "None")
         flexlist.sort(key=lambda p: p.player_points, reverse=True)
+        empty_slots = [p for p in by_points if p.position == "None"]
 
-        others = [p for p in by_points if p.position not in starters]
-        others.sort(key=lambda p: p.position == "None")  # empty slots last
-
-        self.player_list = newlist + flexlist + others
+        if slots_before_flex is None:
+            slots_before_flex = len(starters)
+        before = [p for players in starters[:slots_before_flex] for p in players]
+        after = [p for players in starters[slots_before_flex:] for p in players]
+        self.player_list = before + flexlist + after + empty_slots
 
     def assign_game_status(self, games):
         """

@@ -1,3 +1,5 @@
 *.txt
 *.json
 __pycache__
+!requirements.txt
+.streamlit/secrets.toml
