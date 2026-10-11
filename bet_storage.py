@@ -5,7 +5,9 @@ If the google sheet secrets are set up (see .streamlit/secrets.toml) the bets li
 bet, so every person has their own bets and they survive the app restarting. The sheet needs a tab named "bets"
 with the header row: user, league, season, week, team, spread, placed_at (the columns can be in any order)
 
-Without the secrets it falls back to the local bets/wk<week>.json files, which is one set of bets per machine.
+Without the secrets, your own computer falls back to the local bets/wk<week>.json files, which is one set of bets
+per machine. Those files are shared by everybody looking at the page, so a hosted copy never uses them: there,
+without the sheet, bets are only kept for the browser tab they were entered in (and the page says so).
 
 Either way a set of bets is a dictionary of team -> (spread, timestamp it was entered).
 """
@@ -29,11 +31,14 @@ _sheet_cache = {"pulled": 0, "rows": None, "header": None}
 def using_sheet():
     return _worksheet() is not None
 
-def load_bets(username, season, week):
-    """Returns this person's bets for the week, a dictionary of team -> (spread, timestamp it was entered)."""
+def load_bets(username, season, week, shared_files=True):
+    """
+    Returns this person's bets for the week, a dictionary of team -> (spread, timestamp it was entered).
+    shared_files says whether the local bet files may be used when there is no sheet (only on your own computer).
+    """
     worksheet = _worksheet()
     if worksheet is None:
-        return _load_file(week)
+        return _load_file(week) if shared_files else dict(_tab_bets().get((username.lower(), season, week), {}))
     with _lock:
         rows = _sheet_rows(worksheet)
     bets = {}
@@ -45,11 +50,14 @@ def load_bets(username, season, week):
                 pass  # a row someone typed something odd into by hand shouldn't break everyone else's bets
     return bets
 
-def save_bets(username, league_id, season, week, bets):
+def save_bets(username, league_id, season, week, bets, shared_files=True):
     """Replaces this person's bets for the week with the given dictionary."""
     worksheet = _worksheet()
     if worksheet is None:
-        _save_file(week, bets)
+        if shared_files:
+            _save_file(week, bets)
+        else:
+            _tab_bets()[(username.lower(), season, week)] = dict(bets)
         return
 
     with _lock:
@@ -93,14 +101,20 @@ def _cell(value):
 def _worksheet():
     """The sheet tab the bets are in, or None if the secrets for it aren't set up."""
     try:
-        if "gcp_service_account" not in st.secrets or "bets_sheet_id" not in st.secrets:
+        if "gcp_service_account" not in st.secrets:
+            return None
+        account = dict(st.secrets["gcp_service_account"])
+        # In a toml file anything under the [gcp_service_account] line belongs to it. So if bets_sheet_id was
+        # pasted below that line instead of above it, this is where it ends up, and we look there too.
+        sheet_id = st.secrets.get("bets_sheet_id") or account.pop("bets_sheet_id", None)
+        if not sheet_id:
             return None
     except Exception:
         return None  # no secrets file at all
     import gspread  # only needed when the sheet is used
-    client = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    client = gspread.service_account_from_dict(account)
     client.set_timeout(SHEET_TIMEOUT_SECONDS)
-    return client.open_by_key(st.secrets["bets_sheet_id"]).worksheet(SHEET_TAB)
+    return client.open_by_key(sheet_id).worksheet(SHEET_TAB)
 
 def _sheet_rows(worksheet, fresh=False):
     """
@@ -130,6 +144,15 @@ def _is_mine(row, username, season, week):
     # bets belong to the person, not to one league: they are the same NFL games whichever league is open
     return (str(row.get("user", "")).lower() == username.lower() and str(row.get("season")) == str(season)
             and str(row.get("week")) == str(week) and row.get("spread", "") != "")
+
+
+######################
+# This browser tab only
+######################
+
+def _tab_bets():
+    """Bets kept only for the browser tab they were entered in, {(user, season, week): bets}."""
+    return st.session_state.setdefault("tab_bets", {})
 
 
 ######################

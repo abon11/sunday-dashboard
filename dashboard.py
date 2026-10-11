@@ -3,7 +3,7 @@ import requests
 from sleeper_pull import pull_lineup, pull_league_lineups, current_nfl_week, current_nfl_season, league_season
 import espn_fantasy_pull
 from espn_pull import pull_games, pull_live_spreads, EASTERN
-from bet_storage import load_bets, save_bets
+from bet_storage import load_bets, save_bets, using_sheet
 import html
 import math
 import statistics
@@ -366,8 +366,15 @@ def live_view(site, league_id, who, week):
     # Whose bets these are. Sleeper has usernames, so bets follow the person across their leagues. ESPN doesn't
     # give us one, so there they belong to the team.
     bet_user = who if site == "sleeper" else f"espn-{league_id}-{who}"
+    # The local bet files are one set of bets shared by everybody looking at the page. That is fine on your own
+    # computer, but a hosted copy must never fall back to them or everyone sees (and edits) the same bets.
+    shared_files = running_locally()
     try:
-        bets = load_bets(bet_user, bet_season(site, league_id), week)
+        if not shared_files and not using_sheet():
+            st.warning("Bets are not being saved on this copy of the dashboard: its Google Sheet is not connected "
+                       "(the app's Secrets need `bets_sheet_id` and `[gcp_service_account]`). "
+                       "Bets you enter will only last until you close this tab.")
+        bets = load_bets(bet_user, bet_season(site, league_id), week, shared_files)
     except Exception as e:  # the google sheet can fail in a lot of ways, none of them should take the page down
         print(f"Could not load bets for {bet_user}: {e}")  # details go to the log, not onto everybody's screen
         st.warning("Couldn't load your bets, will keep trying.")
@@ -378,7 +385,7 @@ def live_view(site, league_id, who, week):
     left, right = st.columns([5, 3], gap="medium")
     with left:
         st.markdown(matchup_html(my_lineup, opp_lineup, league_lineups), unsafe_allow_html=True)
-        show_bet_form(games, bet_user, site, league_id, week)
+        show_bet_form(games, bet_user, site, league_id, week, shared_files)
         st.markdown(matchup_legend(site), unsafe_allow_html=True)
     with right:
         st.markdown(slate_html(games, bets, live_spreads), unsafe_allow_html=True)
@@ -550,7 +557,7 @@ def slate_html(games, bets, live_spreads):
 def bet_season(site, league_id):
     return league_season(league_id) if site == "sleeper" else current_nfl_season()
 
-def show_bet_form(games, bet_user, site, league_id, week):
+def show_bet_form(games, bet_user, site, league_id, week, shared_files):
     teams = [team for game in games for team in (game["away_team"], game["home_team"])]
     opponent = {}
     for game in games:
@@ -565,17 +572,17 @@ def show_bet_form(games, bet_user, site, league_id, week):
         spread_col.number_input("Spread", value=0.0, step=0.5, format="%.1f", key="bet_spread",
                                 help="The spread you got, like -2.5 or 3.5. Leave at 0 for a moneyline bet.")
         save_col.form_submit_button("Save", type="primary", width="stretch",
-                                    on_click=change_bets, args=("save", bet_user, site, league_id, week))
+                                    on_click=change_bets, args=("save", bet_user, site, league_id, week, shared_files))
         remove_col.form_submit_button("Remove", width="stretch", help="Remove the bet on the selected team",
-                                      on_click=change_bets, args=("remove", bet_user, site, league_id, week))
+                                      on_click=change_bets, args=("remove", bet_user, site, league_id, week, shared_files))
         clear_col.form_submit_button("Clear", width="stretch", help="Remove every bet this week",
-                                     on_click=change_bets, args=("clear", bet_user, site, league_id, week))
+                                     on_click=change_bets, args=("clear", bet_user, site, league_id, week, shared_files))
 
-def change_bets(action, bet_user, site, league_id, week):
+def change_bets(action, bet_user, site, league_id, week, shared_files):
     try:
         # if the bets can't be read we stop here, rather than saving over them with an incomplete set
         season = bet_season(site, league_id)
-        bets = load_bets(bet_user, season, week)
+        bets = load_bets(bet_user, season, week, shared_files)
         team = st.session_state.get("bet_team")
         if action == "clear":
             bets = {}
@@ -587,7 +594,7 @@ def change_bets(action, bet_user, site, league_id, week):
             spread = round(st.session_state["bet_spread"] * 2) / 2.0  # nearest 0.5
             print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
             bets[team] = (spread, datetime.now().timestamp())
-        save_bets(bet_user, league_id, season, week, bets)
+        save_bets(bet_user, league_id, season, week, bets, shared_files)
     except Exception as e:
         print(f"Could not save bets for {bet_user}: {e}")
         st.session_state["bet_error"] = True
