@@ -118,10 +118,33 @@ def pull_lineup(league_id, team_id, week):
     sleeper_pull.pull_lineup(..., roster='both'). If there is no opponent that week, their Lineup is empty.
     """
     team_id = int(team_id)
-    info = _league_info(league_id)
-    teams = {team["id"]: team for team in info.get("teams") or []}
+    matchups, teams, build_lineup = _league_week(league_id, week)
     if team_id not in teams:
         raise ValueError(f"Team {team_id} was not found in ESPN league {league_id}.")
+
+    for home, away in matchups:
+        if home and home.get("teamId") == team_id:
+            return build_lineup(home), build_lineup(away)
+        if away and away.get("teamId") == team_id:
+            return build_lineup(away), build_lineup(home)
+    raise ValueError(f"No matchup found for {_team_name(teams[team_id])} in week {week}.")
+
+def pull_league_lineups(league_id, week):
+    """
+    Returns the Lineup of every team playing in the league that week, which is what the league median is worked
+    out from. It uses the same pulls as pull_lineup, so calling both costs nothing extra.
+    """
+    matchups, _, build_lineup = _league_week(league_id, week)
+    return [build_lineup(side) for matchup in matchups for side in matchup if side]
+
+def _league_week(league_id, week):
+    """
+    Pulls everything needed to build lineups for a week of a league.
+    Returns (the week's matchups as (home, away) pairs, {team id: team}, a function that turns one side of a
+    matchup into a Lineup).
+    """
+    info = _league_info(league_id)
+    teams = {team["id"]: team for team in info.get("teams") or []}
     members = {m["id"]: m.get("displayName") or "" for m in info.get("members") or []}
     settings = info.get("settings") or {}
 
@@ -145,15 +168,9 @@ def pull_lineup(league_id, team_id, week):
         owner = members.get(team.get("primaryOwner"), "") or team.get("abbrev") or ""
         return Lineup(players, owner, _team_name(team), roster_positions or None)
 
-    for matchup in data.get("schedule") or []:
-        if matchup.get("matchupPeriodId") != matchup_period:
-            continue
-        home, away = matchup.get("home"), matchup.get("away")
-        if home and home.get("teamId") == team_id:
-            return build_lineup(home), build_lineup(away)
-        if away and away.get("teamId") == team_id:
-            return build_lineup(away), build_lineup(home)
-    raise ValueError(f"No matchup found for {_team_name(teams[team_id])} in week {week}.")
+    matchups = [(matchup.get("home"), matchup.get("away")) for matchup in data.get("schedule") or []
+                if matchup.get("matchupPeriodId") == matchup_period]
+    return matchups, teams, build_lineup
 
 def _build_player(entry, week, pro_teams):
     pool_entry = entry.get("playerPoolEntry") or {}

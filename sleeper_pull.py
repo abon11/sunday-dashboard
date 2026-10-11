@@ -23,6 +23,10 @@ FLEX_SLOTS = {"FLEX", "SUPER_FLEX", "REC_FLEX", "WRRB_FLEX", "IDP_FLEX"}  # slot
 BENCH_SLOTS = {"BN", "IR", "TAXI"}
 POSITION_SLOT = {"DE": "DL", "DT": "DL", "NT": "DL", "OLB": "LB", "ILB": "LB",
                  "CB": "DB", "S": "DB", "SS": "DB", "FS": "DB"}  # player positions that fill a differently named slot
+# how much a player's remaining points are assumed to swing, see Player.projection_std
+STD_BASE = 4.0
+STD_PER_POINT = 0.4
+
 DEFAULT_ROSTER_POSITIONS = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX"]  # used if a league doesn't list its slots
 
 
@@ -106,41 +110,20 @@ def pull_lineup(league_id, username, week, roster='both'):
     if not (roster == "both" or roster == "user" or roster == "opponent"):
         raise ValueError("Error: Roster must be either 'both', 'user', or 'opponent'.")
 
-    # --- League info that is static during a slate ---
-    try:
-        rosters = _get(f'{API}/league/{league_id}/rosters', ttl=STATIC_TTL)
-    except requests.HTTPError:
-        rosters = None  # sleeper answers 404 for a league id that doesn't exist
-    if not rosters:
-        raise ValueError(f"Sleeper league '{league_id}' was not found.")
+    matchup_data, roster_ids, build_lineup, roster_positions = _league_week(league_id, week)
+
     user_data = _get(f'{API}/user/{username}', ttl=STATIC_TTL)
     if not user_data:
         raise ValueError(f"Sleeper user '{username}' was not found.")
-    user_id = user_data['user_id']
-    roster_positions = (_get(f'{API}/league/{league_id}', ttl=STATIC_TTL) or {}).get('roster_positions')
-    users = {u['user_id']: u for u in _get(f'{API}/league/{league_id}/users', ttl=STATIC_TTL)}
-    owner_by_roster = {r['roster_id']: r['owner_id'] for r in rosters}
 
     # --- Find your roster_id (different from owner_id!) ---
-    my_roster_id = next((rid for rid, owner in owner_by_roster.items() if owner == user_id), None)
+    my_roster_id = roster_ids.get(user_data['user_id'])
     if my_roster_id is None:
         raise ValueError(f"{username} does not have a team in league {league_id}.")
 
-    players_data = get_player_metadata()
-    projections = get_projections(league_id, week)
-    stats, scoring = get_stats(league_id, week)
-
-    # --- Matchup info for given week (live points) ---
-    matchup_data = _get(f'{API}/league/{league_id}/matchups/{week}', ttl=LIVE_TTL)
-    user_matchup = next((m for m in matchup_data or [] if m['roster_id'] == my_roster_id), None)
+    user_matchup = next((m for m in matchup_data if m['roster_id'] == my_roster_id), None)
     if user_matchup is None:
         raise ValueError(f"No matchup found for {username} in week {week}.")
-
-    def build_lineup(matchup, display_name=None):
-        info = users.get(owner_by_roster.get(matchup['roster_id']), {})
-        name = display_name or info.get('display_name', info.get('username', '---'))
-        team_name = (info.get('metadata') or {}).get('team_name') or info.get('display_name', name)
-        return Lineup(build_players(matchup, players_data, projections, stats, scoring), name, team_name, roster_positions)
 
     if roster == "user":
         return build_lineup(user_matchup, username)
@@ -155,6 +138,47 @@ def pull_lineup(league_id, username, week, roster='both'):
     if roster == "opponent":
         return opponent_lineup
     return build_lineup(user_matchup, username), opponent_lineup
+
+def pull_league_lineups(league_id, week):
+    """
+    Returns the Lineup of every team in the league for the week, which is what the league median is worked out
+    from. It uses the same pulls as pull_lineup, so calling both costs nothing extra.
+    """
+    matchup_data, _, build_lineup, _ = _league_week(league_id, week)
+    return [build_lineup(matchup) for matchup in matchup_data if matchup.get('starters')]
+
+def _league_week(league_id, week):
+    """
+    Pulls everything needed to build lineups for a week of a league. Only the matchup endpoint has live points,
+    the rest is league info that is static during a slate.
+    Returns (the week's matchup entries, {owner's user_id: roster_id}, a function that turns a matchup entry
+    into a Lineup, the league's roster slots).
+    """
+    try:
+        rosters = _get(f'{API}/league/{league_id}/rosters', ttl=STATIC_TTL)
+    except requests.HTTPError:
+        rosters = None  # sleeper answers 404 for a league id that doesn't exist
+    if not rosters:
+        raise ValueError(f"Sleeper league '{league_id}' was not found.")
+    roster_positions = (_get(f'{API}/league/{league_id}', ttl=STATIC_TTL) or {}).get('roster_positions')
+    users = {u['user_id']: u for u in _get(f'{API}/league/{league_id}/users', ttl=STATIC_TTL)}
+    owner_by_roster = {r['roster_id']: r['owner_id'] for r in rosters}
+
+    players_data = get_player_metadata()
+    projections = get_projections(league_id, week)
+    stats, scoring = get_stats(league_id, week)
+
+    # --- Matchup info for given week (live points) ---
+    matchup_data = _get(f'{API}/league/{league_id}/matchups/{week}', ttl=LIVE_TTL) or []
+
+    def build_lineup(matchup, display_name=None):
+        info = users.get(owner_by_roster.get(matchup['roster_id']), {})
+        name = display_name or info.get('display_name', info.get('username', '---'))
+        team_name = (info.get('metadata') or {}).get('team_name') or info.get('display_name', name)
+        return Lineup(build_players(matchup, players_data, projections, stats, scoring), name, team_name, roster_positions)
+
+    roster_ids = {owner: roster_id for roster_id, owner in owner_by_roster.items()}
+    return matchup_data, roster_ids, build_lineup, roster_positions
 
 def _stat_positions(league):
     """Positions to ask sleeper for. The defensive players are only pulled for leagues that start them."""
@@ -335,12 +359,14 @@ class Player:
     def projection_std(self):
         """
         Rough standard deviation of the points still to come, used for the win probability estimate. A player
-        projected for 20 swings by about 7.5 over a full game, one projected for 8 by about 4.5, and it shrinks
-        as their game runs out.
+        projected for 20 swings by about 12 over a full game, one projected for 8 by about 7, and it shrinks
+        as their game runs out. These are deliberately on the wide side: fantasy scores are streaky (one long
+        touchdown is 10+ points) and teammates' scores move together, which a simple model like this would
+        otherwise ignore and come out overconfident. Raise STD_BASE / STD_PER_POINT for even less certainty.
         """
         if self.projected <= 0:
             return 0.0
-        return (2.5 + 0.25 * self.projected) * self.game_remaining ** 0.5
+        return (STD_BASE + STD_PER_POINT * self.projected) * self.game_remaining ** 0.5
 
     def __str__(self):
         return f'{self.team} {self.position} - {self.first_name} {self.last_name}: {self.player_points} pts.'

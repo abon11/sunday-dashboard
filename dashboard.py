@@ -1,11 +1,12 @@
 import streamlit as st
 import requests
-from sleeper_pull import pull_lineup, current_nfl_week, current_nfl_season, league_season
+from sleeper_pull import pull_lineup, pull_league_lineups, current_nfl_week, current_nfl_season, league_season
 import espn_fantasy_pull
 from espn_pull import pull_games, pull_live_spreads, EASTERN
 from bet_storage import load_bets, save_bets
 import html
 import math
+import statistics
 import os
 import re
 import json
@@ -110,6 +111,7 @@ CSS = """
     .sd-tip-head {font-size: 0.85em; opacity: 0.6;}
     .sd-tip-total {margin-top: 3px; padding-top: 4px; border-top: 1px solid rgba(255, 255, 255, 0.3); font-weight: 700;}
     /* skinny win probability bar: fills from my side, with a tick at 50% */
+    .sd-median {grid-column: 1 / -1; margin: -4px 0 4px; text-align: center; font-size: 0.78em; opacity: 0.75;}
     .sd-winbar {grid-column: 1 / -1; position: relative; height: 5px; margin: 0 2px 6px; border-radius: 3px;
                 background: rgba(128, 128, 128, 0.25);}
     .sd-winbar > div {height: 100%; border-radius: 3px;}
@@ -314,6 +316,13 @@ def fetch_lineups(site, league_id, who, week):
         return espn_fantasy_pull.pull_lineup(league_id, who, week)
     return pull_lineup(league_id, who, week)
 
+# every team's lineup, for the league median. It reuses the pulls fetch_lineups just made, so no extra requests
+@st.cache_data(ttl=REFRESH_SECONDS - 1, show_spinner=False, max_entries=200)
+def fetch_league_lineups(site, league_id, week):
+    if site == "espn":
+        return espn_fantasy_pull.pull_league_lineups(league_id, week)
+    return pull_league_lineups(league_id, week)
+
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=200)
 def fetch_espn_teams(league_id):
     return espn_fantasy_pull.league_teams(league_id)
@@ -346,6 +355,14 @@ def live_view(site, league_id, who, week):
         lineup.assign_game_status(games)
         lineup.order_list()
 
+    # the league median is only a comparison line, so if it can't be worked out the page just goes without it
+    try:
+        league_lineups = fetch_league_lineups(site, league_id, week)
+        for lineup in league_lineups:
+            lineup.assign_game_status(games)
+    except (requests.RequestException, ValueError):
+        league_lineups = []
+
     # Whose bets these are. Sleeper has usernames, so bets follow the person across their leagues. ESPN doesn't
     # give us one, so there they belong to the team.
     bet_user = who if site == "sleeper" else f"espn-{league_id}-{who}"
@@ -360,7 +377,7 @@ def live_view(site, league_id, who, week):
 
     left, right = st.columns([5, 3], gap="medium")
     with left:
-        st.markdown(matchup_html(my_lineup, opp_lineup), unsafe_allow_html=True)
+        st.markdown(matchup_html(my_lineup, opp_lineup, league_lineups), unsafe_allow_html=True)
         show_bet_form(games, bet_user, site, league_id, week)
         st.markdown(matchup_legend(site), unsafe_allow_html=True)
     with right:
@@ -372,7 +389,7 @@ def live_view(site, league_id, who, week):
 # Fantasy matchup
 ######################
 
-def matchup_html(my_lineup, opp_lineup):
+def matchup_html(my_lineup, opp_lineup, league_lineups=()):
     """Builds both lineups as one mirrored grid: my player | point difference | their player."""
     lead = my_lineup.total_points - opp_lineup.total_points
     win_prob = win_probability(my_lineup, opp_lineup)
@@ -384,6 +401,14 @@ def matchup_html(my_lineup, opp_lineup):
         f'<div class="sd-winbar" title="Estimated chance to win: {win_prob:.0%}">'
         f'<div style="width:{win_prob:.1%}; background:{WIN_BAR_COLORS[diff_class(win_prob - 0.5)]};"></div></div>',
     ]
+    if len(league_lineups) > 1:
+        # the middle score of every team in the league this week, and the middle of their projected finals
+        median = statistics.median(lineup.total_points for lineup in league_lineups)
+        projected_median = statistics.median(lineup.projected_points for lineup in league_lineups)
+        rows.append(
+            f'<div class="sd-median sd-num" title="The median score of all {len(league_lineups)} teams in the league this week, and the median of their projected finals">'
+            f'League median <b>{median:.2f}</b> · projected <b>{projected_median:.1f}</b></div>'
+        )
     for p, op in zip_longest(my_lineup.player_list, opp_lineup.player_list):
         p_points = p.player_points if p else 0
         op_points = op.player_points if op else 0
