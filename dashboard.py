@@ -1,676 +1,572 @@
 import streamlit as st
-import pandas as pd
+import requests
 from sleeper_pull import pull_lineup
-from espn_pull import pull_games
-import matplotlib.colors as mcolors
+from espn_pull import pull_games, pull_live_spreads
+import html
+import math
 import os
 import json
 from datetime import datetime
-import time
+from itertools import zip_longest
+
+SAVE_STATE_FILENAME = 'save_state.json'
+# league_id = "1313968791364849664"  # FFF league
+USERNAME = "TitsBon"
+REFRESH_SECONDS = 10  # how often the live area re-pulls scores
+
+PLAYER_DIFF_SCALE = 10  # fantasy points ahead/behind where a player box is fully green/red
+BET_DIFF_SCALE = 14     # points ahead of/behind the live line where a game row is fully green/red
+RED, GREY, GREEN = (240, 106, 106), (226, 226, 226), (95, 220, 125)
+BET_WON, BET_LOST = "#17e852", "#ff3b31"  # stronger colors for bets that are final
+LIVE_SPREAD_SECONDS = 30  # how often the in-game betting lines are re-pulled
+
+# names for sleeper's stat keys in the scoring breakdown (anything missing is shown as the cleaned up key)
+STAT_LABELS = {
+    "pass_yd": "Passing Yards", "pass_td": "Passing TD", "pass_int": "Interceptions Thrown", "pass_2pt": "2-Pt Pass",
+    "rush_yd": "Rushing Yards", "rush_td": "Rushing TD", "rush_2pt": "2-Pt Rush",
+    "rec": "Receptions", "rec_yd": "Receiving Yards", "rec_td": "Receiving TD", "rec_2pt": "2-Pt Reception",
+    "fum": "Fumbles", "fum_lost": "Fumbles Lost", "fum_rec_td": "Fumble Recovery TD",
+    "bonus_pass_yd_400": "400+ Passing Yards", "bonus_rush_yd_200": "200+ Rushing Yards",
+    "bonus_rec_yd_200": "200+ Receiving Yards",
+    "xpm": "PAT Made", "xpmiss": "PAT Missed", "fgmiss": "FG Missed", "fgm_0_19": "FG 0-19", "fgm_20_29": "FG 20-29",
+    "fgm_30_39": "FG 30-39", "fgm_40_49": "FG 40-49", "fgm_50p": "FG 50+",
+    "sack": "Sacks", "int": "Interceptions", "fum_rec": "Fumble Recoveries", "ff": "Forced Fumbles",
+    "safe": "Safeties", "blk_kick": "Blocked Kicks", "def_td": "Defensive TD", "st_td": "Special Teams TD",
+    "def_st_td": "Def/ST TD", "st_fum_rec": "ST Fumble Recoveries", "def_st_fum_rec": "Def/ST Fumble Recoveries",
+    "st_ff": "ST Forced Fumbles", "def_st_ff": "Def/ST Forced Fumbles",
+    "pts_allow_0": "0 Points Allowed", "pts_allow_1_6": "1-6 Points Allowed", "pts_allow_7_13": "7-13 Points Allowed",
+    "pts_allow_14_20": "14-20 Points Allowed", "pts_allow_21_27": "21-27 Points Allowed",
+    "pts_allow_28_34": "28-34 Points Allowed", "pts_allow_35p": "35+ Points Allowed",
+}
+
+TEAM_COLORS = {
+    "NYG": "#003C7E", "WSH": "#773141", "DAL": "#041E42", "PHI": "#004C54",
+    "BUF": "#00338D", "MIA": "#008E97", "NYJ": "#125740", "NE": "#002244",
+    "GB": "#203731", "MIN": "#4F2683", "DET": "#0076B6", "CHI": "#0B162A",
+    "CIN": "#FB4F14", "CLE": "#311D00", "BAL": "#241773", "PIT": "#FFB612",
+    "SF": "#AA0000", "LAR": "#003594", "SEA": "#002244", "ARI": "#97233F",
+    "LV": "#000000", "DEN": "#FB4F14", "KC": "#E31837", "LAC": "#0080C6",
+    "CAR": "#0085CA", "ATL": "#A71930", "NO": "#D3BC8D", "TB": "#D50A0A",
+    "IND": "#002C5F", "TEN": "#4B92DB", "HOU": "#03202F", "JAX": "#006778",
+}
+
+# Every box is laid out with flex/grid and sized by its column, so nothing has a fixed pixel width.
+# Names that don't fit are cut off with "..." instead of wrapping.
+CSS = """
+<style>
+    .block-container {padding-top: 2.5rem; padding-bottom: 1rem;}
+    h1 {padding: 0; font-size: 1.9rem;}
+
+    .sd-clip {white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+    .sd-num {font-variant-numeric: tabular-nums;}
+    .sd-tm {flex: none; width: 3.2em; padding: 2px 0; border-radius: 5px; text-align: center;
+            font-size: 0.8em; font-weight: 700;}
+
+    /* state of the game a box belongs to */
+    /* dark text goes on the contents rather than the box, so the live outline keeps the theme's text
+       color and shows up in both light and dark mode */
+    .sd-done > *, .sd-live > * {color: #111;}
+    .sd-done {opacity: 0.7;}
+    .sd-live {border-color: currentColor !important; font-weight: 700;}
+    .sd-idle, .sd-nobet {background: rgba(128, 128, 128, 0.16); opacity: 1;}
+    .sd-idle > *, .sd-nobet > * {color: inherit;}
+
+    /* --- fantasy matchup --- */
+    .sd-match {display: grid; grid-template-columns: minmax(0, 1fr) 3.4em minmax(0, 1fr);
+               gap: 4px 6px; align-items: center; margin-bottom: 8px;}
+    .sd-pc {display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 10px;
+            border: 2px solid transparent; border-radius: 8px; line-height: 1.25;}
+    .sd-pc.sd-right {flex-direction: row-reverse; text-align: right;}
+    .sd-pc.sd-idle, .sd-pc.sd-done {margin: 0 12px;}
+    .sd-pc.sd-live {padding: 7px 10px;}
+    .sd-who {flex: 1; min-width: 0;}
+    .sd-sub {font-size: 0.72em; font-weight: 400; opacity: 0.75;}
+    .sd-pts {flex: none; font-weight: 700;}
+    .sd-diff {text-align: center; font-size: 0.85em; font-weight: 600;}
+    .sd-up {color: #1c9a45;}
+    .sd-down {color: #d64545;}
+    .sd-head {margin-bottom: 4px; font-size: 1.15em; font-weight: 700;}
+    .sd-head .sd-pts {font-size: 1.5em;}
+    .sd-head .sd-pts .sd-sub {font-size: 0.45em;}
+    .sd-win {font-size: 0.95em; white-space: nowrap;}
+    /* scoring breakdown that pops up under a player's points while the mouse is on them */
+    .sd-pc {position: relative;}
+    .sd-pts {cursor: help;}
+    .sd-head .sd-pts {cursor: auto;}
+    .sd-pc > .sd-tip {display: none; position: absolute; top: calc(100% - 2px); right: 0; z-index: 1000;
+                      padding: 8px 12px; border-radius: 8px; background: #1d2230; color: #fff;
+                      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35); font-size: 0.82em; font-weight: 400;
+                      text-align: left; white-space: nowrap; pointer-events: none;}
+    .sd-pc.sd-right > .sd-tip {right: auto; left: 0;}
+    .sd-pts:hover + .sd-tip {display: block;}
+    .sd-pc.sd-done:has(.sd-pts:hover) {opacity: 1;}  /* a faded box would fade its popup too */
+    .sd-tip-grid {display: grid; grid-template-columns: auto auto auto auto; gap: 3px 14px;}
+    .sd-tip-grid > :not(:nth-child(4n + 1)) {text-align: right;}
+    .sd-tip-head {font-size: 0.85em; opacity: 0.6;}
+    .sd-tip-total {margin-top: 3px; padding-top: 4px; border-top: 1px solid rgba(255, 255, 255, 0.3); font-weight: 700;}
+    /* skinny win probability bar: fills from my side, with a tick at 50% */
+    .sd-winbar {grid-column: 1 / -1; position: relative; height: 5px; margin: 0 2px 6px; border-radius: 3px;
+                background: rgba(128, 128, 128, 0.25);}
+    .sd-winbar > div {height: 100%; border-radius: 3px;}
+    .sd-winbar::after {content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px;
+                       margin-left: -1px; background: currentColor; opacity: 0.6;}
+
+    /* --- game slate --- */
+    .sd-game {display: grid; grid-template-columns: 1.2em 3.2em 4.4em 3.2em 1.2em minmax(0, 1fr) auto;
+              gap: 4px; align-items: center; margin-bottom: 4px; padding: 2px 8px;
+              border: 2px solid transparent; border-radius: 8px;}
+    .sd-game.sd-live {padding: 5px 8px;}
+    .sd-game.sd-settled {opacity: 1; font-weight: 600;}
+    .sd-game .sd-tm {width: auto; font-size: 0.85em;}
+    /* the team you bet on: double ring (light then dark) so it stands out on any row color */
+    .sd-tm.sd-pick {box-shadow: 0 0 0 1.5px #fff, 0 0 0 3.5px #111;}
+    .sd-score {text-align: center; font-weight: 700;}
+    .sd-when {margin-left: 6px; font-size: 0.85em; font-weight: 400;}
+    .sd-bet {font-size: 0.85em; text-align: right; white-space: nowrap;}
+    /* tighten the rows when the slate column gets narrow (small window) */
+    .sd-slate {container-type: inline-size;}
+    @container (max-width: 400px) {
+        .sd-game {grid-template-columns: 1.1em 2.9em 3.4em 2.9em 1.1em minmax(0, 1fr) auto;
+                  gap: 2px; padding-left: 4px; padding-right: 4px; font-size: 0.82em;}
+        .sd-when {margin-left: 2px;}
+    }
+
+    div[data-testid="stForm"] button p {white-space: nowrap;}
+    /* streamlit's "Press Enter to submit form" hint is drawn inside the text box, on top of a long league id */
+    div[data-testid="InputInstructions"] {display: none;}
+    div[data-testid="stPopoverBody"] {min-width: 300px;}
+
+    /* --- keys --- */
+    .sd-legend {margin-top: 10px; padding: 8px 12px 10px; border: 1px solid rgba(128, 128, 128, 0.3);
+                border-radius: 8px; font-size: 0.78em;}
+    .sd-legend-title {margin-bottom: 6px; font-size: 0.9em; font-weight: 700; letter-spacing: 0.08em;
+                      text-transform: uppercase; opacity: 0.6;}
+    .sd-legend-grid {display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 6px 20px;}
+    .sd-legend-item {display: flex; align-items: center; gap: 10px; line-height: 1.25;}
+    .sd-legend-key {flex: none; width: 6.2em; text-align: center; font-weight: 600; white-space: nowrap;}
+    .sd-legend-text {opacity: 0.8;}
+    .sd-swatch {display: inline-block; width: 100%; height: 0.9em; border-radius: 3px; vertical-align: middle;
+                background: linear-gradient(90deg, #f06a6a, #e2e2e2, #5fdc7d);}
+    .sd-key {display: inline-block; padding: 0 7px; border: 2px solid transparent; border-radius: 5px;}
+</style>
+"""
 
 
 def main():
-    save_state_filename = 'save_state.json'
-    # league_id = "1180303931006689280"  # FFF league
-    username = "TitsBon"
+    st.set_page_config(page_title="Football Sunday Dashboard", layout="wide")
+    st.markdown(CSS, unsafe_allow_html=True)
 
-    # --- Load saved state or initialize default ---
-    if not os.path.exists(save_state_filename):
-        with open(save_state_filename, 'w') as f:
-            json.dump({"current_week": 1, "league_id": ""}, f, indent=4)
-
-    with open(save_state_filename, 'r') as f:
-        save_state = json.load(f)
-
-    # --- Initialize week if not in session ---
+    # --- Load saved state into the session ---
+    save_state = load_save_state()
     if "selected_week" not in st.session_state:
         st.session_state["selected_week"] = save_state.get("current_week", 1)
-
-    # --- Initialize league_id if not in session ---
     if "league_id" not in st.session_state:
         st.session_state["league_id"] = save_state.get("league_id", "")
 
-    # --- Use the league_id from session (may be empty initially) ---
     league_id = st.session_state["league_id"]
-
-    # --- Instantiate the data manager only if league_id exists ---
-    if league_id:
-        all_data = DataHouse(league_id, username)
-        my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
-    else:
+    if not league_id:
         st.markdown("### Enter League ID")
         st.info("No league currently loaded. Please enter a League ID below to continue.")
-
-        new_league = st.text_input(
-            "League ID",
-            value="",
-            placeholder="Enter your Sleeper League ID",
-            label_visibility="collapsed",
-            key="league_input_init"
-        )
-
-        if new_league.strip():
-            # Save it immediately once user enters something
-            st.session_state["league_id"] = new_league.strip()
-            with open(save_state_filename, 'r+') as f:
-                save_state = json.load(f)
-                save_state["league_id"] = new_league.strip()
-                f.seek(0)
-                json.dump(save_state, f, indent=4)
-                f.truncate()
-
-            st.success("League ID saved! Loading dashboard...")
-            st.rerun()
-        else:
-            st.stop()
-
-    all_data = DataHouse(league_id, username)
-    my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
-
-    bet_file = f'bets/wk{st.session_state["selected_week"]}.json'
-
-    st.session_state.bets = initialize_bet_dict(bet_file)
-
-    # --- UI ---
-    st.set_page_config(page_title="Football Sunday Dashboard", layout="wide")
-    st.markdown(
-        """
-        <style>
-            .block-container {padding-top: 1rem; padding-bottom: 1rem;}
-            h1, h2, h3 {margin-top: 0rem; margin-bottom: 0.5rem;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown("""
-    <style>
-    /* neutral reset only */
-    div.stButton > button,
-    div[data-testid="stButton"] > button,
-    div[data-testid="stButton"] > div > button {
-    margin: 0;
-    padding: 0;
-                
-    min-height: 0 !important;
-    padding: 0 !important;
-    margin: -100 !important;
-    
-    button:hover {
-        opacity: 0.1 !important;
-    }
-    }
-    div[data-testid="stHorizontalBlock"] {
-        margin-top: -14px !important;
-        margin-bottom: -12px !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    params = st.query_params
-    handle_bets(params, bet_file)
+        league_form("league_form_init")
+        st.stop()
 
     # --- Title and Menu ---
-    top_left, top_right = st.columns([3, 1])
-    with top_left:
-        st.title(f"Football Sunday Dashboard - Week {st.session_state["selected_week"]}")
-        st.write("")
-        
-    with top_right:
-        st.write("")
-        st.write("")
+    title_col, week_col, league_col = st.columns([6, 1.3, 1.2], vertical_alignment="bottom")
+    with week_col:
+        st.selectbox(
+            "Select Week",
+            options=range(1, 19),
+            format_func=lambda week: f"Week {week}",
+            label_visibility="collapsed",
+            key="selected_week",
+            on_change=lambda: update_save_state(current_week=st.session_state["selected_week"]),
+        )
+    with league_col:
+        with st.popover("League", width="stretch"):
+            league_form("league_form")
+    title_col.title(f"Football Sunday Dashboard - Week {st.session_state['selected_week']}")
 
-        # --- Load or set default league_id ---
-        if "league_id" not in st.session_state:
-            if os.path.exists(save_state_filename):
-                with open(save_state_filename, 'r') as f:
-                    save_state = json.load(f)
-                league_id = save_state.get("league_id", league_id)
-            st.session_state["league_id"] = league_id
+    live_view(league_id, st.session_state["selected_week"])
 
-        # --- Styling: make compact and side-by-side ---
-        st.markdown("""
-        <style>
-            div[data-baseweb="select"] {
-                max-width: 160px !important;
-                min-width: 160px !important;
-                margin-left: -120px !important;
-                display: inline-block !important;
-                border-radius:10px;
-                border:2px solid black;
-            }
-            div[data-testid="stTextInput"] {
-                max-width: 200px !important;
-                min-width: 200px !important;
-                margin-left: -60px !important;
-                display: inline-block !important;
-                margin-right: 6px !important;
-                border-radius:10px;
-                border:2px solid black;
-            }
-            div[data-testid="stButton"] > button {
-                height: 1.8em !important;
-                font-size: 0.8em !important;
-                padding: 0px 8px !important;
-                background-color:#0073e6;
-                color: white;
-                border:2px solid black;
-            }
-            div[data-testid="column"] {
-                display: flex;
-                align-items: center;
-            }
-        </style>
-        """, unsafe_allow_html=True)
 
-        # --- Compact layout for week + league input + button ---
-        col1, col2, col3 = st.columns([1, 1.3, 0.6], vertical_alignment="center")
+def load_save_state():
+    if not os.path.exists(SAVE_STATE_FILENAME):
+        return {"current_week": 1, "league_id": ""}
+    with open(SAVE_STATE_FILENAME, 'r') as f:
+        return json.load(f)
 
-        with col1:
-            selected_week = st.selectbox(
-                "Select Week",
-                options=[f"Week {i}" for i in range(1, 19)],
-                index=st.session_state["selected_week"] - 1,
-                label_visibility="collapsed",
-                key="week_select"
-            )
+def update_save_state(**changes):
+    save_state = load_save_state()
+    save_state.update(changes)
+    with open(SAVE_STATE_FILENAME, 'w') as f:
+        json.dump(save_state, f, indent=4)
 
-        with col2:
-            new_league = st.text_input(
-                "League ID",
-                value=st.session_state["league_id"],
-                label_visibility="collapsed",
-                placeholder="League ID",
-                key="league_input"
-            )
-
-        with col3:
-            if st.button("Set", use_container_width=True):
-                if new_league.strip():
-                    st.session_state["league_id"] = new_league.strip()
-                    with open(save_state_filename, 'r+') as f:
-                        save_state = json.load(f)
-                        save_state["league_id"] = new_league.strip()
-                        f.seek(0)
-                        json.dump(save_state, f, indent=4)
-                        f.truncate()
-                    st.rerun()
-
-        # --- Handle week switching ---
-        new_week = int(selected_week.split()[-1])
-        if new_week != st.session_state["selected_week"]:
-            with open(save_state_filename, 'r+') as f:
-                save_state = json.load(f)
-                save_state["current_week"] = new_week
-                f.seek(0)
-                json.dump(save_state, f, indent=4)
-                f.truncate()
-            st.session_state["selected_week"] = new_week
+def league_form(key):
+    with st.form(key, border=False):
+        new_league = st.text_input(
+            "Sleeper League ID",
+            value=st.session_state["league_id"],
+            placeholder="Enter your Sleeper League ID",
+        )
+        if st.form_submit_button("Set", type="primary") and new_league.strip():
+            st.session_state["league_id"] = new_league.strip()
+            update_save_state(league_id=new_league.strip())
             st.rerun()
 
-    left, right = st.columns([2, 1], gap="medium")
+
+# The ttl sits just under the refresh interval: each auto refresh pulls fresh data, but reruns caused
+# by clicking something (saving a bet etc.) reuse what was just pulled instead of hitting the apis again.
+@st.cache_data(ttl=REFRESH_SECONDS - 1, show_spinner=False)
+def fetch_games(week):
+    return pull_games(week)
+
+@st.cache_data(ttl=REFRESH_SECONDS - 1, show_spinner=False)
+def fetch_lineups(league_id, username, week):
+    return pull_lineup(league_id, username, week)
+
+# The in-game lines take one request per live game, and move slower than the score, so they refresh less often.
+@st.cache_data(ttl=LIVE_SPREAD_SECONDS, show_spinner=False)
+def fetch_live_spreads(week):
+    return pull_live_spreads(fetch_games(week))
+
+
+@st.fragment(run_every=REFRESH_SECONDS)
+def live_view(league_id, week):
+    """
+    Everything that updates live. Being a fragment, only this part reruns (every REFRESH_SECONDS, or when
+    a bet is saved) - the browser never reloads the page.
+    """
+    try:
+        games = fetch_games(week)
+        my_lineup, opp_lineup = fetch_lineups(league_id, USERNAME, week)
+        live_spreads = fetch_live_spreads(week)
+        st.session_state["last_pull"] = (league_id, week, games, my_lineup, opp_lineup, live_spreads, datetime.now())
+    except (requests.RequestException, ValueError) as e:
+        st.warning(f"Couldn't refresh the data, will keep trying: {e}")
+        last_pull = st.session_state.get("last_pull")
+        if last_pull is None or last_pull[:2] != (league_id, week):
+            return
+    _, _, games, my_lineup, opp_lineup, live_spreads, pulled_at = st.session_state["last_pull"]
+
+    for lineup in (my_lineup, opp_lineup):
+        lineup.assign_game_status(games)
+        lineup.order_list()
+
+    bet_file = f'bets/wk{week}.json'
+    bets = load_bets(bet_file)
+
+    left, right = st.columns([5, 3], gap="medium")
     with left:
-        lineup_placeholder = st.empty()
+        st.markdown(matchup_html(my_lineup, opp_lineup), unsafe_allow_html=True)
+        show_bet_form(games, bet_file)
+        st.markdown(MATCHUP_LEGEND, unsafe_allow_html=True)
     with right:
-        game_placeholder = st.empty()
-
-    # intervals (seconds)
-    pull_interval = 10
-    last_pull = 0
-
-    while True:
-        now = time.time()
-        # Update lineups every 10s
-        if now - last_pull > pull_interval:
-            with game_placeholder.container():
-                games = all_data.get_games(st.session_state["selected_week"])
-                show_games(games, st.session_state.bets)
-            my_lineup, opp_lineup = all_data.get_lineups(st.session_state["selected_week"])
-            with lineup_placeholder.container():
-                lineup_cols = st.columns(2, gap="medium")
-                with lineup_cols[0]:
-                    show_lineup(my_lineup, opp_lineup)
-                with lineup_cols[1]:
-                    show_lineup(opp_lineup, my_lineup)
-                # Bet area directly beneath both lineups
-                st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
-                show_bet_input_area()
-            last_pull = now
-        time.sleep(1)  # loop step
+        st.markdown(slate_html(games, bets, live_spreads), unsafe_allow_html=True)
+    st.caption(f"Updates every {REFRESH_SECONDS}s. Last updated {pulled_at.strftime('%-I:%M:%S %p')}")
 
 
-def handle_bets(params, bet_file):
-    # A. Bet submission takes priority
-    if "bet_team" in params and "spread" in params:
-        team = params["bet_team"]
-        try:
-            val = float(params["spread"])
-            spread = round(val * 2) / 2.0  # nearest 0.5
-            print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
-            st.session_state.bets[team] = (spread, datetime.now().timestamp())
-            # save the bets for when refresh happens
-            with open(bet_file, 'w') as f:
-                json.dump(st.session_state.bets, f, indent=4)
-        except ValueError:
-            print(f"Bad spread for {team}: {params['spread']}")
+######################
+# Fantasy matchup
+######################
 
-        st.session_state.selected_team = None         # clear the bet UI
-        st.query_params.clear()
+def matchup_html(my_lineup, opp_lineup):
+    """Builds both lineups as one mirrored grid: my player | point difference | their player."""
+    lead = my_lineup.total_points - opp_lineup.total_points
+    win_prob = win_probability(my_lineup, opp_lineup)
+    rows = [
+        team_header(my_lineup, "left"),
+        f'<div class="sd-diff sd-num {diff_class(lead)}" title="Your lead, and your estimated chance to win">{lead:+.2f}'
+        f'<div class="sd-win {diff_class(win_prob - 0.5)}">win {win_prob:.0%}</div></div>',
+        team_header(opp_lineup, "right"),
+        f'<div class="sd-winbar" title="Estimated chance to win: {win_prob:.0%}">'
+        f'<div style="width:{win_prob:.1%}; background:{WIN_BAR_COLORS[diff_class(win_prob - 0.5)]};"></div></div>',
+    ]
+    for p, op in zip_longest(my_lineup.player_list, opp_lineup.player_list):
+        p_points = p.player_points if p else 0
+        op_points = op.player_points if op else 0
+        diff = p_points - op_points
+        rows.append(player_box(p, diff, "left"))
+        rows.append(f'<div class="sd-diff sd-num {diff_class(diff)}">{f"{diff:+.1f}" if abs(diff) >= 0.05 else "-"}</div>')
+        rows.append(player_box(op, -diff, "right"))
 
-    # B. Team selection (from clicking a team button)
-    elif "select_team" in params:
-        st.session_state.selected_team = params["select_team"]
-        st.query_params.clear()
-    
-    if "clear_bets" in params:
-        st.session_state.bets = initialize_bet_dict(bet_file, clear=True)
-        st.query_params.clear()
+    return f'<div class="sd-match">{"".join(rows)}</div>'
 
-# helper to render a Lineup
-def show_lineup(lineup, other_lineup):
-    st.subheader(f"{lineup.team_name} ({lineup.username})")
-    st.metric("Total Points", f"{lineup.total_points:.2f}")
-    # st.write("---")
+def team_header(lineup, side):
+    return (
+        f'<div class="sd-pc sd-head sd-{side}">'
+        f'<div class="sd-who"><div class="sd-clip">{html.escape(lineup.team_name)}</div>'
+        f'<div class="sd-sub sd-clip">{html.escape(lineup.username)}</div></div>'
+        f'<div class="sd-pts sd-num">{lineup.total_points:.2f}'
+        f'<div class="sd-sub">proj {lineup.projected_points:.1f}</div></div>'
+        '</div>'
+    )
 
-    lineup.order_list()
-    other_lineup.order_list()
+def win_probability(my_lineup, opp_lineup):
+    """
+    Estimated chance my_lineup wins: the gap between the two projected finals, measured against how much
+    the points still to come typically swing (normal approximation). Sleeper doesn't publish theirs.
+    """
+    diff = my_lineup.projected_points - opp_lineup.projected_points
+    variance = sum(p.projection_std ** 2 for p in my_lineup.player_list + opp_lineup.player_list)
+    if variance == 0:
+        return 1.0 if diff > 0 else 0.0 if diff < 0 else 0.5
+    return 0.5 * (1 + math.erf(diff / math.sqrt(2 * variance)))
 
-    team_colors = get_team_colors()
+def player_box(p, diff, side):
+    if p is None:
+        return '<div></div>'
+    state = state_class(p.game_state)
+    # only color by the matchup once the player's game has started
+    background = "" if state == "sd-idle" else f' style="background:{diff_color(diff, PLAYER_DIFF_SCALE)};"'
+    ball = " 🏈" if p.possession else ""
+    name = html.escape(f"{p.first_name} {p.last_name}")
+    # once a game is final the projection is just the score, so only show it while there is something left
+    projection = f'<div class="sd-sub">proj {p.live_projection:.1f}</div>' if p.game_state in ("pre", "in") else ""
+    return (
+        f'<div class="sd-pc sd-{side} {state}"{background}>'
+        f'{team_badge(p.team)}'
+        f'<div class="sd-who"><div class="sd-clip" title="{name}">{name}</div>'
+        f'<div class="sd-sub sd-clip">{html.escape(p.position)} · {html.escape(p.game_detail or "")}{ball}</div></div>'
+        f'<div class="sd-pts sd-num">{p.player_points:.1f}{projection}</div>'
+        f'{breakdown_popup(p)}'
+        '</div>'
+    )
 
-    for p, op in zip(lineup.player_list, other_lineup.player_list):
-        team_color = team_colors.get(p.team, "#888")
-        color = diff_color(p.player_points, op.player_points)
-        text_decoration = "none"
-        team_border = '#000000'
-        if p.game_status == 'Final' or p.game_status == 'BYE' or p.game_status == 'Scheduled':
-            box_width = 410
-            box_height = 50
-            margin_left = 20
-            vert_padding = 7
-            margin_bottom = 5
-            margin_top = 3
-            font_weight = 500
-            if p.game_status == 'Scheduled':
-                border_color = "#FFFFFF"
-                color = "#bdbdbd"
+def breakdown_popup(p):
+    """The little table shown when hovering a player's points: each stat, points per, points, and the total."""
+    if p.position == "None":
+        return ""
+    if not p.breakdown:
+        return '<div class="sd-tip">No stats yet</div>'
+    cells = ['<span class="sd-tip-head">Stat</span><span class="sd-tip-head"></span>'
+             '<span class="sd-tip-head">Pts per</span><span class="sd-tip-head">Points</span>']
+    # biggest contributions first
+    for stat, amount, per, points in sorted(p.breakdown, key=lambda row: -abs(row[3])):
+        label = STAT_LABELS.get(stat, stat.replace("_", " ").title())
+        cells.append(f'<span>{html.escape(label)}</span><span>{amount:g}</span><span>{per:g}</span><span>{points:.2f}</span>')
+    cells.append(f'<span class="sd-tip-total">Total</span><span class="sd-tip-total"></span>'
+                 f'<span class="sd-tip-total"></span><span class="sd-tip-total">{p.player_points:.2f}</span>')
+    return f'<div class="sd-tip"><div class="sd-tip-grid sd-num">{"".join(cells)}</div></div>'
+
+
+######################
+# Game slate and bets
+######################
+
+def slate_html(games, bets, live_spreads):
+    rows = []
+    summary = {"won": 0, "lost": 0, "push": 0, "ahead": 0, "behind": 0, "even": 0, "upcoming": 0}
+    for game in sort_games(games, bets, live_spreads):
+        state = state_class(game["state"])
+        bet_team, spread = active_bet(game, bets)
+        margin = bet_margin(game, bets, live_spreads)
+
+        background = ""
+        bet_string = ""
+        if bet_team is not None:
+            bet_string = f"{bet_team} ML" if spread == 0 else f"{bet_team} {spread:+.1f}"
+            if game["state"] == "pre":
+                summary["upcoming"] += 1
+            elif game["state"] == "post":
+                result = "won" if margin > 0 else "lost" if margin < 0 else "push"
+                summary[result] += 1
+                bet_string = f'{ {"won": "✓", "lost": "✗", "push": "="}[result] } {bet_string}'
+                # set in stone: full strength color and no fade
+                background = {"won": BET_WON, "lost": BET_LOST, "push": diff_color(0, 1)}[result]
+                state += " sd-settled"
             else:
-                border_color = '#000000'
-        else:
-            box_width = 450
-            box_height = 60
-            margin_left = 0
-            vert_padding = 10
-            margin_bottom = 2
-            margin_top = 0
-            font_weight = 700
-            if p.possession is True:
-                team_border = "#F7F026"
-                text_decoration = "underline"
-            else:
-                border_color = '#000000'
-        st.markdown(
-            f"""
-            <div style="
-                background-color:{color};
-                color:black;
-                border:3px solid {border_color};
-                padding:{vert_padding}px 14px;
-                margin-bottom:{margin_bottom}px;
-                margin-top:{margin_top}px;
-                width:{box_width}px;
-                max-height:{box_height}px;
-                margin-left:{margin_left}px;
-                border-radius:10px;
-                font-weight:500;
-                align-items:center;
-            ">
-                <div style="display:flex; align-items:center; flex-wrap:wrap;">
-                    <div style="
-                        background-color:{team_color};
-                        color:white;
-                        border:3px solid {team_border};
-                        border-radius:6px;
-                        font-weight:700;
-                        width:3.2em;
-                        height:1.6em;
-                        display:flex;
-                        align-items:center;
-                        justify-content:center;
-                        margin-right:8px;
-                    ">
-                        {p.team}
-                    </div>
-                    <div style="text-decoration:{text_decoration}; font-weight:{font_weight};">
-                        {p.first_name} {p.last_name} ({p.position}) - {p.player_points:.1f} pts
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
+                summary["ahead" if margin > 0 else "behind" if margin < 0 else "even"] += 1
+                if bet_team in live_spreads:
+                    live = live_spreads[bet_team]
+                    bet_string = f'{bet_string} · now {"PK" if live == 0 else f"{live:+g}"}'
+                else:
+                    bet_string = f"{bet_string} ({margin:+g})"
+                background = diff_color(margin, BET_DIFF_SCALE)
+        # no bet (or not started): neutral row, but it keeps the bold outline if it is live
+        style = f' style="background:{background};"' if background else ""
+        if not background:
+            state += " sd-nobet"
+
+        away_team = game["away_team"]; home_team = game["home_team"]
+        rows.append(
+            f'<div class="sd-game {state}"{style}>'
+            f'<span>{"🏈" if game["possession"] == away_team else ""}</span>'
+            f'{team_badge(away_team, picked=bet_team == away_team)}'
+            f'<span class="sd-score sd-num">{game["away_score"]} - {game["home_score"]}</span>'
+            f'{team_badge(home_team, picked=bet_team == home_team)}'
+            f'<span>{"🏈" if game["possession"] == home_team else ""}</span>'
+            f'<span class="sd-when sd-clip">{html.escape(game["detail"])}</span>'
+            f'<span class="sd-bet sd-num">{bet_string}</span>'
+            '</div>'
         )
 
-def diff_color(p_points, op_points):
+    if sum(summary.values()) == 0:
+        summary_string = "No bets yet, add one under the lineups."
+    else:
+        parts = []
+        if summary["won"] or summary["lost"] or summary["push"]:
+            record = f'{summary["won"]}-{summary["lost"]}' + (f'-{summary["push"]}' if summary["push"] else "")
+            parts.append(f"<b>{record}</b> final")
+        for key in ("ahead", "behind", "even", "upcoming"):
+            if summary[key]:
+                parts.append(f"<b>{summary[key]}</b> {key}")
+        summary_string = "Bets: " + " · ".join(parts)
+
+    return (
+        '<div class="sd-pc sd-head"><div class="sd-who">Full Slate'
+        f'<div class="sd-sub sd-clip">{summary_string}</div></div></div>'
+        f'<div class="sd-slate">{"".join(rows)}</div>{SLATE_LEGEND}'
+    )
+
+def show_bet_form(games, bet_file):
+    teams = [team for game in games for team in (game["away_team"], game["home_team"])]
+    opponent = {}
+    for game in games:
+        opponent[game["away_team"]] = f'at {game["home_team"]}'
+        opponent[game["home_team"]] = f'vs {game["away_team"]}'
+
+    # The buttons save through callbacks, which run before the live area redraws, so the slate above
+    # shows the change straight away without rerunning anything extra.
+    with st.form("bet_form"):
+        team_col, spread_col, save_col, remove_col, clear_col = st.columns([2.2, 1.3, 1, 1.1, 1], vertical_alignment="bottom")
+        team_col.selectbox("Bet on", options=teams, format_func=lambda t: f"{t} ({opponent[t]})", key="bet_team")
+        spread_col.number_input("Spread", value=0.0, step=0.5, format="%.1f", key="bet_spread",
+                                help="The spread you got, like -2.5 or 3.5. Leave at 0 for a moneyline bet.")
+        save_col.form_submit_button("Save", type="primary", width="stretch",
+                                    on_click=change_bets, args=("save", bet_file))
+        remove_col.form_submit_button("Remove", width="stretch", help="Remove the bet on the selected team",
+                                      on_click=change_bets, args=("remove", bet_file))
+        clear_col.form_submit_button("Clear", width="stretch", help="Remove every bet this week",
+                                     on_click=change_bets, args=("clear", bet_file))
+
+def change_bets(action, bet_file):
+    bets = load_bets(bet_file)
+    team = st.session_state.get("bet_team")
+    if action == "clear":
+        bets = {}
+    elif team is None:
+        return
+    elif action == "remove":
+        bets.pop(team, None)
+    else:
+        spread = round(st.session_state["bet_spread"] * 2) / 2.0  # nearest 0.5
+        print(f"Saved bet: {team} {spread:+.1f}")   # <-- prints to console
+        bets[team] = (spread, datetime.now().timestamp())
+    save_bets(bet_file, bets)
+
+def load_bets(bet_file):
     """
-    Returns a hex color smoothly transitioning from red (down 10)
-    to yellow (even) to green (up 10).
+    Returns a dictionary of team -> (spread, timestamp it was entered) for every team with a bet on it.
     """
+    if not os.path.exists(bet_file):
+        return {}
+    with open(bet_file, 'r') as f:
+        bets = json.load(f)
+    return {team: tuple(bet) for team, bet in bets.items() if bet[0] is not None}
 
-    diff = max(-10, min(10, p_points - op_points))  # clamp between -10 and 10
-    normalized = (diff + 10) / 20.0  # map [-10, 10] → [0, 1]
+def save_bets(bet_file, bets):
+    os.makedirs(os.path.dirname(bet_file), exist_ok=True)
+    with open(bet_file, 'w') as f:
+        json.dump(bets, f, indent=4)
 
-    # cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F14B4B", "#F0F04B", "#50EE50"])  # red → yellow → green
-    cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F63737", "#DCDADA", "#33F333"])
-    return mcolors.to_hex(cmap(normalized))
+def active_bet(game, bets):
+    """
+    Returns (team, spread) for the bet on this game, or (None, None) if there isn't one. If both teams
+    have a bet we take the more recently placed one (we could clear the other bet but unnecessary).
+    """
+    placed = [(bets[team][1], team) for team in (game["away_team"], game["home_team"]) if team in bets]
+    if not placed:
+        return None, None
+    team = max(placed)[1]
+    return team, float(bets[team][0])
 
-def sort_games(games, bet_dict):
-    def get_bet_score(game):
-        """Return the bet spread value (absolute), default 0 if none."""
-        away_team = game["away_team"]
-        home_team = game["home_team"]
-        if bet_dict[away_team][0] is not None and bet_dict[home_team][0] is not None:
-            # take the more recently placed bet (we could clear the other bet but unnecessary)
-            if bet_dict[away_team][1] >= bet_dict[home_team][1]:
-                current_spread = float(game["away_score"]) - float(game["home_score"])  # this shows us what spread we will cover
-                winning_by = current_spread + float(bet_dict[away_team][0])
-            else:
-                current_spread = float(game["home_score"]) - float(game["away_score"])  # this shows us what spread we will cover
-                winning_by = current_spread + float(bet_dict[home_team][0])
-        elif bet_dict[away_team][0] is not None:
-            current_spread = float(game["away_score"]) - float(game["home_score"])  # this shows us what spread we will cover
-            winning_by = current_spread + float(bet_dict[away_team][0])
-        elif bet_dict[home_team][0] is not None:
-            current_spread = float(game["home_score"]) - float(game["away_score"])  # this shows us what spread we will cover
-            winning_by = current_spread + float(bet_dict[home_team][0])
-        else:
-            winning_by = 0
-        # pick whichever exists, or 0 if none
-        return winning_by
+def bet_margin(game, bets, live_spreads):
+    """
+    How far ahead the bet on this game is (negative = behind). 0 if no bet.
+    While the game is live this is measured against the live spread: holding +7.5 when the line is now +5.5
+    is 2 ahead, so a bet starts out neutral at kickoff and only moves as the game does. The live line closes
+    in on the real score as time runs out, so it lands on the same number as the final result, which is what
+    we use once the game is over (or if there is no live line posted).
+    """
+    team, spread = active_bet(game, bets)
+    if team is None:
+        return 0
+    if game["state"] == "in" and team in live_spreads:
+        return spread - live_spreads[team]
+    if team == game["away_team"]:
+        return game["away_score"] - game["home_score"] + spread
+    return game["home_score"] - game["away_score"] + spread
 
+def sort_games(games, bets, live_spreads):
     def sort_key(game):
-        status = game["status"]
-        bet_score = get_bet_score(game)
-
         # group order: in-progress → final → TBD
-        if status not in ["Final", "Scheduled"]:
-            group = 0  # In Progress
-        elif status == "Final":
-            group = 1
-        else:
-            group = 2  # TBD
-
-        # negative bet_score → descending within group
-        return (group, -bet_score)
+        group = {"in": 0, "post": 1}.get(game["state"], 2)
+        # negative margin → descending within group
+        return (group, -bet_margin(game, bets, live_spreads))
 
     return sorted(games, key=sort_key)
 
-def get_team_colors():
-    team_colors = {
-        "NYG": "#003C7E", "WSH": "#773141", "DAL": "#041E42", "PHI": "#004C54",
-        "BUF": "#00338D", "MIA": "#008E97", "NYJ": "#125740", "NE": "#002244",
-        "GB": "#203731", "MIN": "#4F2683", "DET": "#0076B6", "CHI": "#0B162A",
-        "CIN": "#FB4F14", "CLE": "#311D00", "BAL": "#241773", "PIT": "#FFB612",
-        "SF": "#AA0000", "LAR": "#003594", "SEA": "#002244", "ARI": "#97233F",
-        "LV": "#000000", "DEN": "#FB4F14", "KC": "#E31837", "LAC": "#0080C6",
-        "CAR": "#0085CA", "ATL": "#A71930", "NO": "#D3BC8D", "TB": "#D50A0A",
-        "IND": "#002C5F", "TEN": "#4B92DB", "HOU": "#03202F", "JAX": "#006778",
-    }
-    return team_colors
 
+######################
+# Shared pieces
+######################
 
-def show_games(games, bet_dict):
-    st.subheader("Full Slate")
-    # games = pull_games(week)
-    games = sort_games(games, bet_dict)
+def state_class(game_state):
+    return {"in": "sd-live", "post": "sd-done"}.get(game_state, "sd-idle")
 
-    if "selected_team" not in st.session_state:
-        st.session_state.selected_team = None
-    if "bets" not in st.session_state:
-        st.session_state.bets = {}
+def diff_class(diff):
+    return "sd-up" if diff > 0 else "sd-down" if diff < 0 else ""
 
-    team_colors = get_team_colors()
+def diff_color(diff, scale):
+    """
+    Returns a hex color smoothly transitioning from red (down by scale)
+    to grey (even) to green (up by scale).
+    """
+    normalized = max(-1.0, min(1.0, diff / scale))
+    target = GREEN if normalized >= 0 else RED
+    weight = abs(normalized)
+    return "#%02x%02x%02x" % tuple(round(g + (t - g) * weight) for g, t in zip(GREY, target))
 
-    for game in games:
-        away_team = game["away_team"]; home_team = game["home_team"]
-        away_color = team_colors.get(away_team, "#888"); home_color = team_colors.get(home_team, "#888")
-        status = f"Q{game['quarter']} {game['clock']}" if game["status"] == "In Progress" else "TBD" if game["status"] == "Scheduled" else game["status"]
-        away_score = f"{int(game['away_score']):>2}"; home_score = f"{int(game['home_score']):>2}"
+def team_badge(team, picked=False):
+    color = TEAM_COLORS.get(team, "#888888")
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    # dark text on the few light team colors (PIT, NO) so the abbreviation stays readable
+    text = "#111" if (0.299 * r + 0.587 * g + 0.114 * b) > 160 else "white"
+    pick = " sd-pick" if picked else ""
+    return f'<span class="sd-tm{pick}" style="background:{color}; color:{text};">{html.escape(team)}</span>'
 
-        def construct_bet_string(team, spread):
-            if spread == 0:
-                string = f'{team}: ML'
-            else:
-                string = f'{team}: {spread:+.1f}'
-            return string
-        
-        def compute_score_color(rooting_team_score, against_team_score, spread, status):
-            current_spread = float(rooting_team_score) - float(against_team_score)  # this shows us what spread we will cover
-            winning_by = current_spread + float(spread)
-            if status == "Final":
-                if winning_by > 0:
-                    return "#33F333"
-                else:
-                    return "#F63737"
-            diff = max(-14, min(14, winning_by))  # clamp between -14 and 14
-            normalized = (diff + 14) / 28.0  # map [-14, 14] → [0, 1]
-            cmap = mcolors.LinearSegmentedColormap.from_list("perf", ["#F63737", "#DCDADA", "#33F333"])
-            return mcolors.to_hex(cmap(normalized))
+def legend_html(title, items):
+    """Builds a key box from (symbol html, description) pairs, laid out in aligned columns."""
+    cells = "".join(
+        f'<div class="sd-legend-item"><span class="sd-legend-key">{key}</span>'
+        f'<span class="sd-legend-text">{text}</span></div>'
+        for key, text in items
+    )
+    return (f'<div class="sd-legend"><div class="sd-legend-title">{title}</div>'
+            f'<div class="sd-legend-grid">{cells}</div></div>')
 
-        if bet_dict[away_team][0] is not None and bet_dict[home_team][0] is not None:
-            # take the more recently placed bet (we could clear the other bet but unnecessary)
-            if bet_dict[away_team][1] >= bet_dict[home_team][1]:
-                bet_string = construct_bet_string(away_team, bet_dict[away_team][0])
-                bg_color = compute_score_color(away_score, home_score, bet_dict[away_team][0], status)
-            else:
-                bet_string = construct_bet_string(home_team, bet_dict[home_team][0])
-                bg_color = compute_score_color(home_score, away_score, bet_dict[home_team][0], status)
-        elif bet_dict[away_team][0] is not None:
-            bet_string = construct_bet_string(away_team, bet_dict[away_team][0])
-            bg_color = compute_score_color(away_score, home_score, bet_dict[away_team][0], status)
-        elif bet_dict[home_team][0] is not None:
-            bet_string = construct_bet_string(home_team, bet_dict[home_team][0])
-            bg_color = compute_score_color(home_score, away_score, bet_dict[home_team][0], status)
-        else:
-            bet_string = '---'
-            bg_color = "#bdbdbd"
-        
-        border_color = "#000000"
-        if status == "TBD":
-            bg_color = "#bdbdbd"
-            border_color = "#FFFFFF"
+WIN_BAR_COLORS = {"sd-up": "#1c9a45", "sd-down": "#d64545", "": "#9a9a9a"}
 
+MATCHUP_LEGEND = legend_html("Lineup key", [
+    ('<span class="sd-swatch"></span>', f"Performance relative to the player across from them"),
+    ('<span class="sd-key sd-live" style="background:#e2e2e2;"><span>Bold</span></span>', "Playing right now"),
+    ('<span class="sd-key sd-done" style="background:#e2e2e2;"><span>Faded</span></span>', "Game is final"),
+    ('<span class="sd-key sd-idle">Grey</span>', "Not started, or on bye"),
+    ("🏈", "Their team has the ball"),
+    ("pts", "Hover a player's points for their scoring breakdown"),
+    ("proj", "Projected final: from Sleeper's projections"),
+    ("win %", "Estimated from the projections (not Sleeper's calculation)"),
+])
 
-        home_border = "#000000"
-        away_border = "#000000"
-        if game["possession"] == home_team:
-            home_border = "#F7F026"
-        elif game["possession"] == away_team:
-            away_border = "#F7F026"
-
-        params = st.query_params
-        if "clicked_team" in params:
-            clicked = params["clicked_team"]
-            print(f"Clicked {clicked}")  # appears in terminal
-            st.session_state.selected_team = clicked
-            st.query_params.clear()  # reset after handling
-
-        if game["status"] == "In Progress":
-            margin_bottom = 0
-            margin_top = 0
-            box_width = 460
-            box_height = 50
-            margin_left = 0
-            border_thickness = 3
-            vert_padding = 3
-        else:
-            margin_bottom = 1
-            margin_top = 1
-            box_width = 430
-            box_height = 40
-            margin_left = 15
-            border_thickness = 3
-            vert_padding = 1
-
-        st.markdown(f"""
-        <div style="
-            background-color:{bg_color};
-            border: {border_thickness}px solid {border_color};
-            border-radius: 4px;
-            padding: {vert_padding}px 3px;
-            margin: 0px;            /* eliminates spacing */
-            margin-bottom:{margin_bottom}px;
-            margin-top:{margin_top}px;
-            width:{box_width}px;
-            max-height:{box_height}px;
-            margin-left:{margin_left}px;
-        ">
-        <div style="display:flex; align-items:center;">
-            <div style="flex:0.4;">
-                <form action="" method="get" style="margin:0;">
-                <input type="hidden" name="select_team" value="{away_team}">
-                    <button type="submit" style="
-                        background-color:{away_color};
-                        color:white;
-                        border:3px solid {away_border};
-                        border-radius:6px;
-                        font-weight:700;
-                        width:3.8em;
-                        height:2em;
-                        cursor:pointer;
-                    ">
-                        {away_team}
-                    </button>
-                </form>
-            </div>
-            <div style="flex:0.8; text-align:center; font-family:monospace; font-weight:bold;">
-            {away_score} - {home_score}
-            </div>
-            <div style="flex:0.4;">
-                <form action="" method="get" style="margin:0;">
-                <input type="hidden" name="select_team" value="{home_team}">
-                    <button type="submit" style="
-                        background-color:{home_color};
-                        color:white;
-                        border:3px solid {home_border};
-                        border-radius:6px;
-                        font-weight:700;
-                        width:3.8em;
-                        height:2em;
-                        cursor:pointer;
-                    ">
-                        {home_team}
-                    </button>
-                </form>
-            </div>
-            <div style="flex:2.0; font-family:monospace; margin-left:10px;">
-            {status} | {bet_string}
-            </div>
-        </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-def show_bet_input_area():
-    team = st.session_state.get("selected_team")
-    st.markdown("<hr style='margin-top:2px; margin-bottom:4px;'>", unsafe_allow_html=True)
-
-    if not team:
-        # Move info box up and add "Clear Bets" button on right
-        st.markdown("""
-        <style>
-        div[data-testid="stAlert"] {
-            margin-top: -35px !important;
-            width: 85% !important;       /* ✅ change width here */
-            margin-left: 0px !important; /* optional: move slightly right */
-        }
-        </style>
-
-
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-right:12px; margin-top:0px;">
-            <div style="flex:1;">
-                <div id="info-box"></div>
-            </div>
-            <div>
-                <form action="" method="get" style="margin-top:0px;">
-                    <input type="hidden" name="clear_bets" value="1">
-                    <button type="submit"
-                        style="background-color:#FF4B4B; color:white; border:none;
-                               border-radius:6px; height:32px; width:100px;
-                               font-weight:600; cursor:pointer;">
-                        Clear Bets
-                    </button>
-                </form>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Render info box in its proper place (fills the left side of flex)
-        st.info("Click a team in the game list to start or edit a bet.")
-        return
-
-    st.markdown(f"""
-    <div style="margin-left:6px; margin-top:-5px; font-weight:700; font-size:1.1em;">
-        Enter the spread for the bet you placed on <span style="color:#0073e6;">{team}</span> (Moneyline=0):
-    </div>
-    <div style="margin-top:4px; margin-left:6px; display:flex; align-items:center;">
-        <form action="" method="get" style="display:flex; align-items:center; gap:8px;">
-            <input type="number" name="spread" step="0.5" required
-                   style="width:90px;height:30px;font-size:14px;border-radius:6px;border:1px solid #bbb;text-align:center;">
-            <input type="hidden" name="bet_team" value="{team}">
-            <button type="submit"
-                    style="background-color:#0073e6;color:white;border:none;border-radius:6px;height:32px;width:100px;font-weight:600;cursor:pointer;">
-                Save Bet
-            </button>
-        </form>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-def initialize_bet_dict(bet_file, clear=False):
-    os.makedirs(os.path.dirname(bet_file), exist_ok=True)
-    if not os.path.exists(bet_file) or clear is True:
-        # dictionary of a tuple where the first entry is the spread and the second is the datetime it was entered
-        bets = {
-            "NYG": (None, None), "WSH": (None, None), "DAL": (None, None), "PHI": (None, None),
-            "BUF": (None, None), "MIA": (None, None), "NYJ": (None, None), "NE": (None, None),
-            "GB": (None, None), "MIN": (None, None), "DET": (None, None), "CHI": (None, None),
-            "CIN": (None, None), "CLE": (None, None), "BAL": (None, None), "PIT": (None, None),
-            "SF": (None, None), "LAR": (None, None), "SEA": (None, None), "ARI": (None, None),
-            "LV": (None, None), "DEN": (None, None), "KC": (None, None), "LAC": (None, None),
-            "CAR": (None, None), "ATL": (None, None), "NO": (None, None), "TB": (None, None),
-            "IND": (None, None), "TEN": (None, None), "HOU": (None, None), "JAX": (None, None),
-        }
-        with open(bet_file, 'w') as f:
-            json.dump(bets, f, indent=4)
-    else:
-        with open(bet_file, 'r') as f:
-            bets = json.load(f)
-
-    return bets
-
-
-class DataHouse:
-    def __init__(self, league_id, username):
-        self.league_id = league_id
-        self.username = username
-
-        self.cached_mylineup = None
-        self.cached_opplineup = None
-
-        self.cached_games = None
-        self.cached_games_week = None
-
-    def get_lineups(self, week):
-        mylineup, opplineup = pull_lineup(self.league_id, self.username, week)
-        if self.cached_games is not None and self.cached_games_week == week:
-            mylineup.assign_game_status(self.cached_games)
-            opplineup.assign_game_status(self.cached_games)
-        self.cached_mylineup = mylineup
-        self.cached_opplineup = opplineup
-        return mylineup, opplineup
-
-    def get_games(self, week):
-        self.cached_games = pull_games(week)
-        self.cached_games_week = week
-        return self.cached_games
+SLATE_LEGEND = legend_html("Slate key", [
+    ('<span class="sd-swatch"></span>', f"Your bet is worse to better than the live spread (full color at {BET_DIFF_SCALE}+ pts)"),
+    ('<span class="sd-tm sd-pick" style="display:inline-block; width:3.2em; background:#555; color:white;">TM</span>', "The team you bet on"),
+    ("now -3.5", "The live spread for your team"),
+    ("(+3)", "No live line posted: covering by 3 on the scoreboard"),
+    (f'<span class="sd-key" style="background:{BET_WON}; color:#111;">✓</span> '
+     f'<span class="sd-key" style="background:{BET_LOST}; color:#111;">✗</span>', "Final: bet won / lost"),
+    ("🏈", "Has the ball"),
+])
 
 
 if __name__ == "__main__":

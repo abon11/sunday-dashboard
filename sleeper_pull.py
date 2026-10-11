@@ -1,8 +1,19 @@
-import pandas as pd
 import requests
 import json
 from datetime import datetime
 import os
+import time
+
+API = 'https://api.sleeper.app/v1'
+STATIC_TTL = 3600  # seconds to reuse league info that basically never changes mid-slate (rosters, users)
+PLAYER_FIELDS = ("first_name", "last_name", "position", "injury_status", "team", "number")
+
+_session = requests.Session()  # one connection reused for every call instead of a new handshake each time
+_response_cache = {}           # url -> (time pulled, json)
+_players_cache = {"date": None, "data": None}
+_projection_cache = {}         # (league_id, week) -> (time pulled, {player_id: projected points})
+PROJECTION_POSITIONS = ("QB", "RB", "WR", "TE", "K", "DEF")
+
 
 def main():
     # league_id = '1180303931006689280'  # FFF league
@@ -17,123 +28,179 @@ def main():
     pull_picks(pickem_league_id, 'abonacci')
 
 
+def _get(url, ttl=0):
+    """
+    GETs a sleeper endpoint and returns the json. If ttl is passed, the response is kept in memory and
+    reused for that many seconds, so the things that don't change during a game aren't re-pulled every refresh.
+    """
+    now = time.time()
+    cached = _response_cache.get(url)
+    if ttl and cached and now - cached[0] < ttl:
+        return cached[1]
+    resp = _session.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if ttl:
+        _response_cache[url] = (now, data)
+    return data
+
+
 def pull_lineup(league_id, username, week, roster='both'):
     """
     This function calls the sleeper api and obtains the roster data. It has the functionality
     to do this for both the user and the user's opponent.
-    This is kinda gross i wanna make it cleaner
+
+    Only the matchup endpoint is hit on every call (it is the only one with live points). The rosters,
+    users and player metadata are cached.
 
     Parameters:
         - league_id (str): This is a string of the league id, a long set of numbers. Ours is 1180303931006689280
         - username (str): This is the user's username in sleeper
-        - week(int): Week number of interest. 
+        - week(int): Week number of interest.
         - roster (str): This can be 'both', 'user', or 'opponent', and it just dictates which rosters to return.
         roster='both' is default.
 
     Returns:
         - player_data (Lineup): This is a simple class that houses the lineup (which is defined below).
-        Doing this instead of their dict because they have a ton of  stuff we won't need so transferring 
+        Doing this instead of their dict because they have a ton of  stuff we won't need so transferring
         everything would be inefficient.
-        If roster='both' is passed, two of these vectors are returned, the first one for the user's team, the 
-        second one for the opponent's team.
+        If roster='both' is passed, two of these vectors are returned, the first one for the user's team, the
+        second one for the opponent's team. If there is no opponent that week, the opponent Lineup is empty.
     """
     if not (roster == "both" or roster == "user" or roster == "opponent"):
         raise ValueError("Error: Roster must be either 'both', 'user', or 'opponent'.")
 
-    # --- Get all rosters in league ---
-    url_rosters = f'https://api.sleeper.app/v1/league/{league_id}/rosters'
-    data = requests.get(url_rosters).json()
-
-    # --- Get your user_id ---
-    url_user = f'https://api.sleeper.app/v1/user/{username}'
-    user_data = requests.get(url_user).json()
-    user_id = user_data['user_id']
-    user_teamname = next(u["metadata"].get("team_name", u["display_name"]) for u in requests.get(f"https://api.sleeper.app/v1/league/{league_id}/users").json() if u["user_id"] == user_id)
-
+    # --- League info that is static during a slate ---
+    rosters = _get(f'{API}/league/{league_id}/rosters', ttl=STATIC_TTL)
+    if not rosters:
+        raise ValueError(f"No rosters found for league {league_id}.")
+    user_id = _get(f'{API}/user/{username}', ttl=STATIC_TTL)['user_id']
+    users = {u['user_id']: u for u in _get(f'{API}/league/{league_id}/users', ttl=STATIC_TTL)}
+    owner_by_roster = {r['roster_id']: r['owner_id'] for r in rosters}
 
     # --- Find your roster_id (different from owner_id!) ---
-    my_roster = next(roster for roster in data if roster['owner_id'] == user_id)
-    my_roster_id = my_roster['roster_id']
-    my_player_ids = my_roster['players']
+    my_roster_id = next((rid for rid, owner in owner_by_roster.items() if owner == user_id), None)
+    if my_roster_id is None:
+        raise ValueError(f"{username} does not have a team in league {league_id}.")
 
-    # --- Player metadata ---
     players_data = get_player_metadata()
+    projections = get_projections(league_id, week)
+    stats, scoring = get_stats(league_id, week)
 
-    # --- Matchup info for given week ---
-    url_matchups = f'https://api.sleeper.app/v1/league/{league_id}/matchups/{week}'
-    matchup_data = requests.get(url_matchups).json()
+    # --- Matchup info for given week (live points) ---
+    matchup_data = _get(f'{API}/league/{league_id}/matchups/{week}')
+    user_matchup = next((m for m in matchup_data or [] if m['roster_id'] == my_roster_id), None)
+    if user_matchup is None:
+        raise ValueError(f"No matchup found for {username} in week {week}.")
 
-    # Find your matchup entry
-    user_roster = next(matchup for matchup in matchup_data if matchup['roster_id'] == my_roster_id)
-    # get the starters on the user team
+    def build_lineup(matchup, display_name=None):
+        info = users.get(owner_by_roster.get(matchup['roster_id']), {})
+        name = display_name or info.get('display_name', info.get('username', '---'))
+        team_name = (info.get('metadata') or {}).get('team_name') or info.get('display_name', name)
+        return Lineup(build_players(matchup, players_data, projections, stats, scoring), name, team_name)
 
     if roster == "user":
-        player_list = build_players(user_roster, players_data)
-        return Lineup(player_list, username, user_teamname)
-    else:
-        # if it isn't just the user, we must get the other starters as well
-        # --- Now get the opposing team's roster ---
-        my_mid = user_roster.get("matchup_id")
-        # find all rosters sharing the same matchup_id (handles doubleheaders / 3+ team formats too)
-        same_mid = [m for m in matchup_data if m.get("matchup_id") == my_mid]
-        # opponent entries are everyone in same_mid except me
-        opponents = [m for m in same_mid if m["roster_id"] != my_roster_id]
-        # usually head-to-head => one opponent; use the first if so
-        opponent_roster = opponents[0] if opponents else None
+        return build_lineup(user_matchup, username)
 
-        # Get opponent teamname
-        opp_owner_id = next(r['owner_id'] for r in data if r['roster_id'] == opponent_roster['roster_id'])
-        # get all league users (you can move this above and reuse)
-        users = requests.get(f'https://api.sleeper.app/v1/league/{league_id}/users').json()
-        opponent_info = next(u for u in users if u['user_id'] == opp_owner_id)
-        opponent_teamname = opponent_info['metadata'].get('team_name', opponent_info.get('display_name'))
-        opponent_username = opponent_info.get('display_name', opponent_info.get('username'))
+    # opponent is whoever else shares the same matchup_id (None on a bye / when eliminated)
+    my_mid = user_matchup.get("matchup_id")
+    opponent_matchup = next((m for m in matchup_data
+                             if my_mid is not None and m.get("matchup_id") == my_mid and m["roster_id"] != my_roster_id),
+                            None)
+    opponent_lineup = build_lineup(opponent_matchup) if opponent_matchup else Lineup([], "---", "No opponent")
 
-        if roster == "opponent":
-            player_list =  build_players(opponent_roster, players_data)
-            return Lineup(player_list, opponent_username, opponent_teamname)
-        else:
-            return Lineup(build_players(user_roster, players_data), username, user_teamname), Lineup(build_players(opponent_roster, players_data), opponent_username, opponent_teamname)
+    if roster == "opponent":
+        return opponent_lineup
+    return build_lineup(user_matchup, username), opponent_lineup
 
-def build_players(roster, players_data):
+def get_projections(league_id, week):
     """
-    Given a list of player ids, it creates a list of Player objects initiated with no points
+    Returns a dictionary of player_id -> projected fantasy points for the week, scored with this league's
+    scoring settings. These are sleeper's full-game projections (the same stat lines the app uses).
+    This endpoint isn't in sleeper's public docs, so if it ever fails we just return no projections
+    rather than taking the dashboard down. Refreshed at most once per STATIC_TTL.
     """
-    starter_ids = roster['starters']    # list of player IDs
+    cached = _projection_cache.get((league_id, week))
+    if cached and time.time() - cached[0] < STATIC_TTL:
+        return cached[1]
+    try:
+        league = _get(f'{API}/league/{league_id}', ttl=STATIC_TTL)
+        scoring = league.get('scoring_settings') or {}
+        positions = '&'.join(f'position[]={pos}' for pos in PROJECTION_POSITIONS)
+        raw = _get(f'https://api.sleeper.app/projections/nfl/{league["season"]}/{week}?season_type=regular&{positions}')
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"Warning: could not pull projections: {e}")
+        return {}
+
+    projections = {}
+    for entry in raw:
+        stats = entry.get('stats') or {}
+        projections[entry['player_id']] = sum(stats.get(stat, 0) * value for stat, value in scoring.items())
+    _projection_cache[(league_id, week)] = (time.time(), projections)
+    return projections
+
+def get_stats(league_id, week):
+    """
+    Returns ({player_id: {stat: value}}, the league's scoring settings) for the week, which is what a player's
+    points are made of. Like the projections this endpoint isn't in sleeper's public docs, so a failure just
+    means no breakdowns. It is pulled fresh every time since the stats are live.
+    """
+    try:
+        league = _get(f'{API}/league/{league_id}', ttl=STATIC_TTL)
+        positions = '&'.join(f'position[]={pos}' for pos in PROJECTION_POSITIONS)
+        raw = _get(f'https://api.sleeper.app/stats/nfl/{league["season"]}/{week}?season_type=regular&{positions}')
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"Warning: could not pull stats: {e}")
+        return {}, {}
+    return {entry['player_id']: entry.get('stats') or {} for entry in raw}, league.get('scoring_settings') or {}
+
+def build_players(roster, players_data, projections=None, stats=None, scoring=None):
+    """
+    Given a matchup entry, it creates a list of Player objects for the starters
+    """
+    projections = projections or {}
+    stats = stats or {}
+    scoring = scoring or {}
+    points = roster.get('players_points') or {}
     players = []
-    for player in starter_ids:
-        try:
-            # make espn and sleeper agree
-            if players_data[player]["team"] == 'WAS':
-                team = 'WSH'
-            else:
-                team = players_data[player]["team"]
-            players.append(Player(players_data[player]["first_name"], 
-                                players_data[player]["last_name"], 
-                                players_data[player]["position"],
-                                players_data[player]["injury_status"],
-                                roster.get('players_points', {})[player],
-                                team,
-                                players_data[player]["number"]))
-        except KeyError:
+    for player in roster.get('starters') or []:  # list of player IDs
+        data = players_data.get(player)
+        if data is None:
+            # empty starting slot
             players.append(Player("---", "---", "None", "None", 0, "--", 0))
+            continue
+        # make espn and sleeper agree
+        team = 'WSH' if data.get("team") == 'WAS' else (data.get("team") or "--")
+        players.append(Player(data.get("first_name") or "",
+                              data.get("last_name") or "",
+                              data.get("position") or "None",
+                              data.get("injury_status"),
+                              points.get(player) or 0,
+                              team,
+                              data.get("number"),
+                              projections.get(player) or 0))
+        # every stat that scored (or cost) them something: (stat, amount, points per, points)
+        player_stats = stats.get(player) or {}
+        players[-1].breakdown = [(stat, player_stats[stat], per, player_stats[stat] * per)
+                                 for stat, per in scoring.items() if per and player_stats.get(stat)]
     return players
 
 def pull_player_metadata(json_file, datefile):
     """
-    - This pulls all of the player metadata for each player when needed. Sleeper says 
-    "it is intended only to be used once per day at most to keep your player IDs updated. 
-    The average size of this query is 5MB." 
-    - When calling this function, it will pull everything then save it to the JSON.
+    - This pulls all of the player metadata for each player when needed. Sleeper says
+    "it is intended only to be used once per day at most to keep your player IDs updated.
+    The average size of this query is 5MB."
+    - When calling this function, it will pull everything then save it to the JSON. Only the fields
+    in PLAYER_FIELDS are saved, which keeps the file ~20x smaller and much faster to load.
     - It will also log the date in which it was pulled in datefile.
     """
     print("PULLING FROM SLEEPER")
     # --- Player metadata ---
-    url_players = 'https://api.sleeper.app/v1/players/nfl'
-    players_data = requests.get(url_players).json()
+    players_data = _get(f'{API}/players/nfl')
+    players_data = {pid: {field: p.get(field) for field in PLAYER_FIELDS} for pid, p in players_data.items()}
 
     with open(json_file, 'w') as f:
-        json.dump(players_data, f, indent=4)
+        json.dump(players_data, f)
 
     # Get the current date and time to log it
     current_datetime = datetime.now()
@@ -146,34 +213,39 @@ def get_player_metadata(json_file='players_data.json', datefile='last_pull.txt')
     """
     This returns all of the player metadata. If the datefile shows that the last date pulled was not
     today, we will pull the updated player metadata. If we are already updated, it will just return.
+    The parsed file is kept in memory for the rest of the day so it is only read from disk once.
     """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _players_cache["date"] == today:
+        return _players_cache["data"]
+
     try:
         with open(datefile, "r") as file:
             date_last_pulled = file.readline().strip()
     except FileNotFoundError:
         print(f"Warning: The file '{datefile}' was not found. Defaulting to None.")
         date_last_pulled = "none"
-    
+
     # check the current date against when we last pulled
-    current_datetime = datetime.now()
-    if current_datetime.strftime("%Y-%m-%d") != date_last_pulled or not os.path.exists(json_file):
+    if today != date_last_pulled or not os.path.exists(json_file):
         # if we pulled more than a day ago, pull it to update (or if the json just doesn't exist)
         pull_player_metadata(json_file, datefile)
 
-    # then update and return
     with open(json_file, 'r') as f:
         data = json.load(f)
-    
+
+    _players_cache["date"] = today
+    _players_cache["data"] = data
     return data
 
 
 class Player:
     """
     This class houses all of the information that we actually care about for a player. This object is returned
-    for each player in vector format in pull_lineup(). Note that the variable names are exactly the same as the 
+    for each player in vector format in pull_lineup(). Note that the variable names are exactly the same as the
     unique keys in the dictionary for a player from the Sleeper API. They should be pretty self explainatory.
     """
-    def __init__(self, first_name, last_name, position, injury_status, player_points, team, number):
+    def __init__(self, first_name, last_name, position, injury_status, player_points, team, number, projected=0):
         self.first_name = first_name
         self.last_name = last_name
         self.position = position
@@ -182,11 +254,32 @@ class Player:
         self.team = team
         self.number = number
         self.game_status = None
+        self.game_state = None   # 'pre', 'in', 'post' or 'bye'
+        self.game_detail = None  # clock / kickoff time text
+        self.game_remaining = 1.0  # fraction of their game still to be played
+        self.projected = projected  # full-game projection from before kickoff
+        self.breakdown = []  # scoring breakdown, a list of (stat, amount, points per, points)
         self.possession = None
+
+    @property
+    def live_projection(self):
+        """Where they are projected to finish: what they have, plus their projection for the time that is left."""
+        return self.player_points + self.projected * self.game_remaining
+
+    @property
+    def projection_std(self):
+        """
+        Rough standard deviation of the points still to come, used for the win probability estimate. A player
+        projected for 20 swings by about 7.5 over a full game, one projected for 8 by about 4.5, and it shrinks
+        as their game runs out.
+        """
+        if self.projected <= 0:
+            return 0.0
+        return (2.5 + 0.25 * self.projected) * self.game_remaining ** 0.5
 
     def __str__(self):
         return f'{self.team} {self.position} - {self.first_name} {self.last_name}: {self.player_points} pts.'
-    
+
     def __repr__(self):
         return str(self)
 
@@ -202,45 +295,38 @@ class Lineup:
         self.total_points = self.calc_total_points()
 
     def calc_total_points(self):
-        pts = 0.0
-        for player in self.player_list:
-            pts += player.player_points
-        return pts
-    
-    def order_list(self, pos_ordering=["QB", "RB", "WR", "TE", "FLX"]):
+        return sum((player.player_points for player in self.player_list), 0.0)
+
+    @property
+    def projected_points(self):
+        """Projected final score. Call assign_game_status first so finished games stop counting."""
+        return sum((player.live_projection for player in self.player_list), 0.0)
+
+    def order_list(self, starters={"QB": 1, "RB": 2, "WR": 2, "TE": 1}):
         """
-        This orders the player list by position and then by points
+        This orders the player list by position and then by points. The top scorers at each position fill the
+        starting slots (starters gives how many per position), everyone left over at those positions goes to
+        the flex spots, and any other positions (K, DEF, empty slots) go at the end.
         """
-        def bubble_sort_players(arr):
-            n = len(arr)
-            for i in range(n - 1):
-                for j in range(0, n - i - 1):
-                    if arr[j].player_points < arr[j + 1].player_points:  # Compare and swap for descending order
-                        arr[j], arr[j + 1] = arr[j + 1], arr[j]
-            return arr
-        
+        by_points = sorted(self.player_list, key=lambda p: p.player_points, reverse=True)
+
         newlist = []
         flexlist = []
+        for pos, count in starters.items():
+            players = [p for p in by_points if p.position == pos]
+            newlist.extend(players[:count])
+            flexlist.extend(players[count:])
+        flexlist.sort(key=lambda p: p.player_points, reverse=True)
 
-        for pos in pos_ordering:
-            if pos != "FLX":
-                players = self.get_players_by_pos(pos)
-                sorted = bubble_sort_players(players)
-                newlist.append(sorted.pop(0))
-                if (pos == "RB" or pos == "WR"):
-                    newlist.append(sorted.pop(0))
-                if len(sorted) > 0:
-                    flexlist.extend(sorted)
-            else:
-                sorted_flex = bubble_sort_players(flexlist)
-                newlist.extend(sorted_flex)
-                newlist.extend(self.get_players_by_pos("None"))  # add potential None players to the end
-        self.player_list = newlist
+        others = [p for p in by_points if p.position not in starters]
+        others.sort(key=lambda p: p.position == "None")  # empty slots last
+
+        self.player_list = newlist + flexlist + others
 
     def assign_game_status(self, games):
         """
         Given a list of game dictionaries (each with home_team, away_team, status, etc),
-        updates each player's .game_status and .possession based on their team's current game.
+        updates each player's game fields and .possession based on their team's current game.
         """
         # Precompute lookup table for O(1) access
         team_to_game = {}
@@ -251,12 +337,16 @@ class Lineup:
         for player in self.player_list:
             game = team_to_game.get(player.team)
             if game:
-                player.possession = False
                 player.game_status = game["status"]
-                if game['possession'] == player.team:
-                    player.possession = True
+                player.game_state = game["state"]
+                player.game_detail = game["detail"]
+                player.game_remaining = game["remaining"]
+                player.possession = game['possession'] == player.team
             else:
                 player.game_status = "BYE"
+                player.game_state = "bye"
+                player.game_detail = "BYE"
+                player.game_remaining = 0.0
                 player.possession = None
 
 
@@ -272,7 +362,7 @@ class Lineup:
         for player in self.player_list:
             string += f'{str(player)}\n'
         return string
-    
+
     def __repr__(self):
         return str(self)
 
