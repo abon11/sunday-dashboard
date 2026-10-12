@@ -85,6 +85,8 @@ CSS = """
     .sd-pc.sd-right {flex-direction: row-reverse; text-align: right;}
     .sd-pc.sd-idle, .sd-pc.sd-done {margin: 0 12px;}
     .sd-pc.sd-live {padding: 7px 10px;}
+    /* grey outline once a player's game is over, to tell them apart from one who hasn't played yet */
+    .sd-pc.sd-done, .sd-key.sd-done {border-color: #6f6f6f;}
     .sd-who {flex: 1; min-width: 0;}
     .sd-sub {font-size: 0.72em; font-weight: 400; opacity: 0.75;}
     .sd-pts {flex: none; font-weight: 700;}
