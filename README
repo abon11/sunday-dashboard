@@ -1,4 +1,4 @@
-This is the code to what will be the most complete personalized sunday dashboard to have alongside NFL redzone, keeping track of bets, big games, and player props for your fantasy teams, all in one place for easy viewing.
+This is the most complete personalized sunday dashboard to have alongside NFL redzone, keeping track of bets, big games, and player props for your fantasy teams, all in one place for easy viewing.
 
 Need `conda install streamlit requests` in your conda environment (streamlit 1.50 or newer).
 
